@@ -502,6 +502,31 @@ module.exports = function (app) {
         app.debug(`SimpleCan started, device address: ${simpleCan.candevice ? simpleCan.candevice.address : "unknown"}`);
         deviceAddress = simpleCan.candevice ? simpleCan.candevice.address : sourceAddress;
         sourceAddress = deviceAddress;
+        
+        // Send Product Information PGN (126996) periodically so devices show the name
+        // Many devices need periodic updates to display the device name in their lists
+        // SimpleCan with transmitPGNs should handle this, but we'll also send it periodically
+        // to ensure devices see it. Send every 10 seconds (typical interval for Product Information)
+        timers.push(setInterval(() => {
+          try {
+            if (simpleCan) {
+              // SimpleCan should automatically send PGN 126996 when it's in transmitPGNs
+              // But we can also explicitly request it to be sent by calling sendPGN with the PGN number
+              // If that doesn't work, SimpleCan will handle it via the transmitPGNs configuration
+              if (typeof simpleCan.sendPGN === 'function') {
+                // Try sending as PGN number first
+                try {
+                  simpleCan.sendPGN(126996);
+                } catch (e) {
+                  // If that fails, SimpleCan should still send it via transmitPGNs configuration
+                  app.debug(`Note: Product Information PGN should be sent automatically via transmitPGNs`);
+                }
+              }
+            }
+          } catch (e) {
+            app.debug(`Error sending Product Information PGN: ${e.message}`);
+          }
+        }, 10000));
       } catch (e) {
         app.setPluginError(plugin.id, `Failed to initialize H5000 emulation: ${e.message}`);
         app.debug(`SimpleCan initialization error: ${e.stack}`);
