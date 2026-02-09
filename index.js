@@ -17,7 +17,6 @@ module.exports = function (app) {
     "Encodes Signal K values into B&G proprietary key/value PGN 130824";
 
   let timers = [];
-  let seq = 0;
   let latestPathSuggestions = [];
   let pathRefreshTimer = null;
   let simpleCan = null;
@@ -290,14 +289,15 @@ module.exports = function (app) {
   }
 
   function encodeNumber(val, bytes, signed) {
-    const max = signed ? (1 << (bytes * 8 - 1)) - 1 : (1 << (bytes * 8)) - 1;
-    const min = signed ? -(1 << (bytes * 8 - 1)) : 0;
+    const bits = bytes * 8;
+    const max = signed ? (2 ** (bits - 1)) - 1 : (2 ** bits) - 1;
+    const min = signed ? -(2 ** (bits - 1)) : 0;
     const clamped = Math.max(min, Math.min(max, Math.round(val)));
     const out = [];
-    let tmp = clamped >= 0 ? clamped : clamped + (1 << (bytes * 8));
+    let tmp = clamped >= 0 ? clamped : clamped + (2 ** bits);
     for (let i = 0; i < bytes; i++) {
       out.push(tmp & 0xff);
-      tmp >>= 8;
+      tmp = Math.floor(tmp / 256);
     }
     return out;
   }
@@ -310,8 +310,12 @@ module.exports = function (app) {
     return value;
   }
 
+  // Manufacturer Code 381 (B&G/Navico), Reserved 0b11, Industry Group 4 (Marine)
+  // Bit layout: [mfg_code:11][reserved:2][industry:3] = 0x7D 0x99
+  const PROPRI_HEADER = [0x7d, 0x99];
+
   function buildPayload(mappings) {
-    const bytes = [];
+    const bytes = [...PROPRI_HEADER];
 
     mappings.forEach((map) => {
       const def = KEY_DEFS.find((d) => d.key === map.key);
@@ -339,44 +343,6 @@ module.exports = function (app) {
     return Buffer.from(bytes);
   }
 
-  function buildFastPacketFrames(payload) {
-    if (!payload || payload.length === 0) return [];
-    const frames = [];
-    const totalLen = payload.length;
-    let offset = 0;
-    const localSeq = seq++ & 0x1f; // 5 bits
-    let frameNum = 0;
-
-    while (offset < totalLen) {
-      const frame = Buffer.alloc(8, 0xff);
-      frame[0] = ((frameNum & 0x07) << 5) | localSeq;
-      if (frameNum === 0) {
-        frame[1] = totalLen;
-        const copyLen = Math.min(6, totalLen);
-        payload.copy(frame, 2, 0, copyLen);
-        offset += copyLen;
-      } else {
-        const copyLen = Math.min(7, totalLen - offset);
-        payload.copy(frame, 1, offset, offset + copyLen);
-        offset += copyLen;
-      }
-      frames.push(frame);
-      frameNum++;
-    }
-    return frames;
-  }
-
-  function frameToActisense(frame, opts) {
-    const ts = new Date().toISOString();
-    const priority = opts.priority ?? 6;
-    const src = opts.src ?? 0;
-    const dst = opts.destination ?? 255;
-    const hex = Array.from(frame)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join(",");
-    return `${ts},${priority},130824,${src},${dst},8,${hex}`;
-  }
-
   function sendN2k(msg) {
     if (simpleCan) {
       simpleCan.sendPGN(msg);
@@ -387,18 +353,20 @@ module.exports = function (app) {
 
   function sendOnce(cfg) {
     const payload = buildPayload([cfg]);
-    if (!payload || payload.length === 0) return;
-    const frames = buildFastPacketFrames(payload);
-    const opts = {
-      priority: cfg.priority || 6,
-      destination: cfg.destination ?? 255,
-      src: cfg.sourceAddress ?? sourceAddress
-    };
+    // Payload with only the 2-byte manufacturer header means no data
+    if (!payload || payload.length <= PROPRI_HEADER.length) return;
 
-    frames.forEach((frame) => {
-      const line = frameToActisense(frame, opts);
-      sendN2k(line);
-    });
+    const ts = new Date().toISOString();
+    const priority = cfg.priority || 6;
+    const src = cfg.sourceAddress ?? sourceAddress;
+    const dst = cfg.destination ?? 255;
+    const hex = Array.from(payload)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join(",");
+    // Send complete payload as one Actisense message;
+    // SimpleCan / canbus driver handles fast-packet framing automatically
+    const msg = `${ts},${priority},130824,${src},${dst},${payload.length},${hex}`;
+    sendN2k(msg);
   }
 
   function sendKeepAlive(src) {
@@ -470,7 +438,7 @@ module.exports = function (app) {
           app,
           canDevice: canDevice,
           preferredAddress: sourceAddress,
-          transmitPGNs: [126996],
+          transmitPGNs: [126996, 130824],
           addressClaim: {
             "Unique Number": 1731561,
             "Manufacturer Code": "Navico",
@@ -503,30 +471,8 @@ module.exports = function (app) {
         deviceAddress = simpleCan.candevice ? simpleCan.candevice.address : sourceAddress;
         sourceAddress = deviceAddress;
         
-        // Send Product Information PGN (126996) periodically so devices show the name
-        // Many devices need periodic updates to display the device name in their lists
-        // SimpleCan with transmitPGNs should handle this, but we'll also send it periodically
-        // to ensure devices see it. Send every 10 seconds (typical interval for Product Information)
-        timers.push(setInterval(() => {
-          try {
-            if (simpleCan) {
-              // SimpleCan should automatically send PGN 126996 when it's in transmitPGNs
-              // But we can also explicitly request it to be sent by calling sendPGN with the PGN number
-              // If that doesn't work, SimpleCan will handle it via the transmitPGNs configuration
-              if (typeof simpleCan.sendPGN === 'function') {
-                // Try sending as PGN number first
-                try {
-                  simpleCan.sendPGN(126996);
-                } catch (e) {
-                  // If that fails, SimpleCan should still send it via transmitPGNs configuration
-                  app.debug(`Note: Product Information PGN should be sent automatically via transmitPGNs`);
-                }
-              }
-            }
-          } catch (e) {
-            app.debug(`Error sending Product Information PGN: ${e.message}`);
-          }
-        }, 10000));
+        // Product Information (PGN 126996) is handled automatically by SimpleCan
+        // via the transmitPGNs configuration — it responds to ISO Requests
       } catch (e) {
         app.setPluginError(plugin.id, `Failed to initialize H5000 emulation: ${e.message}`);
         app.debug(`SimpleCan initialization error: ${e.stack}`);
