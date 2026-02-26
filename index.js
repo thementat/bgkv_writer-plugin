@@ -314,29 +314,17 @@ module.exports = function (app) {
   plugin.start = function (options) {
     // Subscribe to several commonly seen event names for N2K JSON
     const handlers = [];
+    const handler = (data) => onAnyN2k(data, options || {});
 
-    const wrap = (ev) => (data) => onAnyN2k(data, options || {});
+    for (const ev of ['nmea2000Json', 'N2KAnalyzerOut', 'n2kJson']) {
+      try {
+        app.on(ev, handler);
+        handlers.push(ev);
+      } catch (_) {}
+    }
 
-    try {
-      // signalk-server typically emits 'nmea2000Json'
-      app.on('nmea2000Json', wrap('nmea2000Json'));
-      handlers.push(['nmea2000Json', wrap('nmea2000Json')]);
-    } catch (_) {}
-
-    try {
-      // some paths use 'N2KAnalyzerOut'
-      app.on('N2KAnalyzerOut', wrap('N2KAnalyzerOut'));
-      handlers.push(['N2KAnalyzerOut', wrap('N2KAnalyzerOut')]);
-    } catch (_) {}
-
-    try {
-      // sometimes 'n2kJson'
-      app.on('n2kJson', wrap('n2kJson'));
-      handlers.push(['n2kJson', wrap('n2kJson')]);
-    } catch (_) {}
-
-    unsubscribe = handlers.map(([ev, fn]) => () => {
-      try { app.removeListener(ev, fn); } catch (_) {}
+    unsubscribe = handlers.map((ev) => () => {
+      try { app.removeListener(ev, handler); } catch (_) {}
     });
     app.debug(`${plugin.name} started: listening for PGN 130824`);
   };
