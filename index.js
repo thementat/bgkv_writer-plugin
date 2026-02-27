@@ -5,7 +5,12 @@
 
   Encodes B&G proprietary key/value PGN 130824 from selected Signal K paths.
   Each mapping can have its own send interval, priority, and destination.
-  Values are packed into fast-packet frames and emitted via `nmea2000out`.
+  Values are packed into fast-packet frames and sent via raw SocketCAN or
+  app.emit('nmea2000out') as a fallback.
+
+  When emulate=true, the plugin claims its own NMEA 2000 address as an
+  "H5000 CPU" device using a raw SocketCAN socket, completely independent of
+  the canboatjs gateway that SignalK already runs on can0.
 */
 
 module.exports = function (app) {
@@ -17,12 +22,21 @@ module.exports = function (app) {
     "Encodes Signal K values into B&G proprietary key/value PGN 130824";
 
   let timers = [];
+  let claimTimer = null;
   let latestPathSuggestions = [];
   let pathRefreshTimer = null;
-  let simpleCan = null;
+  let rawCanChannel = null;
   let sourceAddress = 14;
-  const KEEPALIVE_PGN =
-    "%s,7,65305,%s,255,8,41,9f,01,17,1c,01,00,00"; // borrowed from bandg performance plugin
+  let seqCounter = 0;
+  let heartbeatSeq = 0;
+  let ourNAME = null;
+  let pluginOptions = {};
+
+  const KEEPALIVE_DATA = Buffer.from([0x41, 0x9F, 0x01, 0x17, 0x1C, 0x01, 0x00, 0x00]);
+
+  // PGN 130847 stub payload — Navico header [0x13, 0x99] + 54 × 0xFF = 56 bytes.
+  // Pre-computed once; buildFastPacketFrames only reads this buffer (never writes it).
+  const PGN130847_PAYLOAD = Buffer.concat([Buffer.from([0x13, 0x99]), Buffer.alloc(54, 0xFF)]);
 
   // scale = physical units per raw integer (raw * scale => value)
   const KEY_DEFS = [
@@ -211,6 +225,16 @@ module.exports = function (app) {
           title: "Default source address (H5000-compatible default is 14)",
           default: 14
         },
+        modelId: {
+          type: "string",
+          title: "Model ID (shown on chartplotter device list)",
+          default: "H5000 CPU"
+        },
+        serialNumber: {
+          type: "string",
+          title: "Serial Number (shown on chartplotter device list)",
+          default: "005469"
+        },
         keepAliveEnabled: {
           type: "boolean",
           title:
@@ -288,6 +312,10 @@ module.exports = function (app) {
     pathRefreshTimer = setInterval(refreshPathSuggestions, 15000);
   }
 
+  // ===========================================================================
+  // Encoding helpers (unchanged)
+  // ===========================================================================
+
   function encodeNumber(val, bytes, signed) {
     const bits = bytes * 8;
     const max = signed ? (2 ** (bits - 1)) - 1 : (2 ** bits) - 1;
@@ -304,9 +332,6 @@ module.exports = function (app) {
 
   function toPluginUnits(path, value) {
     if (value == null) return null;
-    // Convert from Signal K default units into what B&G payload expects.
-    // Temperature keys use Kelvin scaling (centi-K); no offset needed.
-    // Rates/angles use radians already; speeds/distances are metric in SK.
     return value;
   }
 
@@ -340,189 +365,456 @@ module.exports = function (app) {
       bytes.push(...valueBytes);
     });
 
+    // PGN 130824 is always a fast-packet PGN — pad to guarantee > 8 bytes
+    // so receivers don't confuse it for a single-frame message.
+    while (bytes.length <= 8) {
+      bytes.push(0xff);
+    }
+
     return Buffer.from(bytes);
   }
 
-  function sendN2k(msg) {
-    if (simpleCan) {
-      simpleCan.sendPGN(msg);
+  // ===========================================================================
+  // CAN ID utilities
+  // ===========================================================================
+
+  // Compute a 29-bit extended CAN ID from PGN, priority, source, and optional
+  // destination.  For PDU1 PGNs (PF < 0xF0) the destination fills the PS byte;
+  // for PDU2 PGNs the PS byte is part of the PGN itself.
+  function computeCanId(pgn, priority, src, dst) {
+    const dp = (pgn >> 16) & 0x01;
+    const pf = (pgn >> 8) & 0xFF;
+    const ps = pf < 0xF0 ? ((dst !== undefined ? dst : 0xFF) & 0xFF) : (pgn & 0xFF);
+    return ((priority & 0x07) << 26) | (dp << 24) | (pf << 16) | (ps << 8) | (src & 0xFF);
+  }
+
+  // Decode a 29-bit CAN ID into PGN, destination, and source address.
+  function parseCanId(id) {
+    const dp = (id >>> 24) & 0x01;
+    const pf = (id >>> 16) & 0xFF;
+    const ps = (id >>> 8) & 0xFF;
+    const sa = id & 0xFF;
+    let pgn, dst;
+    if (pf < 0xF0) {
+      // PDU1: PS is the destination address; PGN has zero in PS byte
+      pgn = (dp << 16) | (pf << 8);
+      dst = ps;
     } else {
-      app.emit("nmea2000out", msg);
+      // PDU2: PS is the group extension, part of PGN; destination is broadcast
+      pgn = (dp << 16) | (pf << 8) | ps;
+      dst = 0xFF;
+    }
+    return { pgn, dst, sa };
+  }
+
+  // ===========================================================================
+  // NMEA 2000 NAME (64-bit device identity)
+  // ===========================================================================
+
+  // Build an 8-byte NAME buffer using the same identity fields as the Teensy
+  // H5000 emulator (manufacturer 275 / Navico, class 90, function 190,
+  // industry group 4 / Marine).  uniqueNumber must be distinct from the
+  // Teensy's (1448861) to avoid a NAME collision.
+  function buildNAME(uniqueNumber) {
+    const buf = Buffer.alloc(8, 0);
+    const mfgCode = 275;      // Navico
+    const devClass = 90;      // Internal Environment
+    const devFunction = 190;
+    const industryGroup = 4;  // Marine
+
+    // bits 0-20: unique number, bits 21-31: manufacturer code
+    const word0 = ((uniqueNumber & 0x1FFFFF) | ((mfgCode & 0x7FF) << 21)) >>> 0;
+    buf.writeUInt32LE(word0, 0);
+
+    // byte 4: device instance lower (3 bits) + upper (5 bits) — both 0
+    buf[4] = 0;
+    // byte 5: device function
+    buf[5] = devFunction & 0xFF;
+    // byte 6: reserved (bit 0 = 0) + device class (bits 1-7)
+    buf[6] = (devClass & 0x7F) << 1;
+    // byte 7: system instance (0) + industry group + self-configurable (1)
+    buf[7] = ((industryGroup & 0x07) << 4) | 0x80;
+
+    return buf;
+  }
+
+  // Compare two 8-byte NAME buffers as unsigned 64-bit integers (MSB first).
+  // Returns -1 if a < b, 0 if equal, +1 if a > b.  Lower NAME wins arbitration.
+  function compareNAME(a, b) {
+    for (let i = 7; i >= 0; i--) {
+      if (a[i] < b[i]) return -1;
+      if (a[i] > b[i]) return 1;
+    }
+    return 0;
+  }
+
+  // ===========================================================================
+  // Fast-packet framing
+  // ===========================================================================
+
+  // Split a payload buffer into NMEA 2000 fast-packet CAN frames.
+  // Byte 0 of each frame: [seq(3 bits) << 5] | [frameNumber(5 bits)]
+  // seq is a 3-bit counter (0-7) that increments per message.
+  // IMPORTANT: seq must be masked to 3 bits before shifting.  A 5-bit value
+  // (e.g. seq=8) would give (8<<5)=256 which wraps to 0x00 in a Buffer byte,
+  // making the 9th message look identical to the 1st and confusing receivers.
+  function buildFastPacketFrames(canId, payload) {
+    const seq = seqCounter & 0x07;          // 3-bit: (seq<<5) is always 0..0xE0 — no byte overflow
+    seqCounter = (seqCounter + 1) & 0x07;
+    const frames = [];
+
+    const f0 = Buffer.alloc(8, 0xFF);
+    f0[0] = (seq << 5) | 0x00;
+    f0[1] = payload.length;
+    payload.copy(f0, 2, 0, Math.min(6, payload.length));
+    frames.push({ id: canId, ext: true, data: f0 });
+
+    let offset = 6;
+    let frameNum = 1;
+    while (offset < payload.length) {
+      const f = Buffer.alloc(8, 0xFF);
+      f[0] = (seq << 5) | (frameNum & 0x1F);   // frameNum max=19 < 32, mask explicit for safety
+      payload.copy(f, 1, offset, Math.min(offset + 7, payload.length));
+      frames.push({ id: canId, ext: true, data: f });
+      offset += 7;
+      frameNum++;
+    }
+
+    return frames;
+  }
+
+  // ===========================================================================
+  // Product Information payload (PGN 126996, 134 bytes)
+  // ===========================================================================
+
+  function buildProductInfoPayload(modelId, serialCode) {
+    // 0xFF-init matches NMEA 2000 convention (0xFF = data not available for unused bytes)
+    // and matches what the working Teensy H5000 emulator sends.
+    const buf = Buffer.alloc(134, 0xFF);
+    buf.writeUInt16LE(2100, 0);                            // NMEA 2000 Version
+    buf.writeUInt16LE(246, 2);                             // Product Code
+    buf.write(modelId || "H5000 CPU", 4, 32, "ascii");    // Model ID
+    buf.write("2.0.45.0.29", 36, 32, "ascii");            // Software Version
+    // bytes 68-99: Model Version — leave as 0xFF (data not available)
+    buf.write(serialCode || "005469", 100, 32, "ascii");  // Serial Code
+    buf.writeUInt8(0, 132);                                // Certification Level
+    buf.writeUInt8(1, 133);                                // Load Equivalency
+    return buf;
+  }
+
+  // ===========================================================================
+  // Address claiming and ISO request handling
+  // ===========================================================================
+
+  function sendAddressClaim(address) {
+    if (!rawCanChannel || !ourNAME) return;
+    // PGN 60928, priority 6, addressed to global (0xFF)
+    const canId = computeCanId(60928, 6, address, 0xFF);
+    try {
+      // Pass a copy of ourNAME so the native binding always gets a fresh buffer
+      rawCanChannel.send({ id: canId, ext: true, data: Buffer.from(ourNAME) });
+      app.debug(`Address claim sent for 0x${address.toString(16).padStart(2, '0')}, canId=0x${canId.toString(16).toUpperCase()}`);
+    } catch (e) {
+      app.debug(`sendAddressClaim error: ${e.message}`);
     }
   }
+
+  function sendProductInfoResponse() {
+    if (!rawCanChannel) return;
+    const payload = buildProductInfoPayload(pluginOptions.modelId, pluginOptions.serialNumber);
+    const canId = computeCanId(126996, 6, sourceAddress, 0xFF);
+    const frames = buildFastPacketFrames(canId, payload);
+    app.debug(`Sending Product Info (${frames.length} frames, seq=${frames[0].data[0] >> 5})`);
+
+    // Pace frames with setImmediate so we don't overflow the CAN TX FIFO.
+    // The MCP2515 on PiCAN has a 3-frame hardware TX buffer; sending 20 frames
+    // in a tight loop saturates the kernel TX queue and causes silent drops.
+    // setImmediate latency is <1 ms — well within NMEA 2000 inter-frame limits.
+    function sendNext(idx) {
+      if (idx >= frames.length) {
+        app.debug('Product Info response complete');
+        return;
+      }
+      try {
+        rawCanChannel.send(frames[idx]);
+      } catch (e) {
+        app.debug(`Product Info frame ${idx} send error: ${e.message}`);
+      }
+      setImmediate(() => sendNext(idx + 1));
+    }
+    sendNext(0);
+  }
+
+  // PGN 130847 (0x1FF1F) — B&G proprietary sailing/race data.
+  // Triton2 polls this every ~700 ms at startup; 1 Hz broadcast keeps it satisfied.
+  // Payload: Navico manufacturer header [0x13, 0x99] + 54 bytes 0xFF = 56 bytes total.
+  // Header encoding: mfg_code=275 (Navico), reserved=0b11, industry=4 (Marine)
+  //   → 16-bit LE: 275 | (3<<11) | (4<<13) = 0x9913 → bytes [0x13, 0x99]
+  function sendPgn130847() {
+    if (!rawCanChannel) return;
+    const canId = computeCanId(130847, 6, sourceAddress, 0xFF);
+    const frames = buildFastPacketFrames(canId, PGN130847_PAYLOAD);
+    function sendNext(idx) {
+      if (idx >= frames.length) return;
+      try { rawCanChannel.send(frames[idx]); } catch (e) { app.debug(`PGN 130847 frame ${idx} error: ${e.message}`); }
+      setImmediate(() => sendNext(idx + 1));
+    }
+    sendNext(0);
+  }
+
+  // PGN 126998 (0x1F016) — NMEA 2000 Config Info.
+  // Polled during device enumeration; stub stops re-polling.
+  function sendPgn126998Response() {
+    if (!rawCanChannel) return;
+    const payload = Buffer.alloc(32, 0xFF);
+    const canId = computeCanId(126998, 6, sourceAddress, 0xFF);
+    const frames = buildFastPacketFrames(canId, payload);
+    function sendNext(idx) {
+      if (idx >= frames.length) return;
+      try { rawCanChannel.send(frames[idx]); } catch (e) { app.debug(`PGN 126998 frame ${idx} error: ${e.message}`); }
+      setImmediate(() => sendNext(idx + 1));
+    }
+    sendNext(0);
+  }
+
+  function handleIncoming(msg) {
+    if (!msg || msg.rtr) return;
+    const data = Buffer.isBuffer(msg.data) ? msg.data : Buffer.from(msg.data);
+    const { pgn, dst, sa } = parseCanId(msg.id);
+
+    // ---- Address conflict resolution (PGN 60928) ----
+    // Another device is claiming the same address we hold.
+    if (pgn === 60928 && sa === sourceAddress && ourNAME) {
+      if (data.length < 8) return;
+      const theirNAME = data.slice(0, 8);
+      // Ignore our own frame reflected back (same NAME)
+      if (compareNAME(theirNAME, ourNAME) === 0) return;
+
+      if (compareNAME(theirNAME, ourNAME) < 0) {
+        // They have a lower (winning) NAME — we must vacate
+        let next = sourceAddress + 1;
+        if (next > 253) next = 1;
+        app.debug(`Address conflict at 0x${sourceAddress.toString(16)}, moving to 0x${next.toString(16)}`);
+        sourceAddress = next;
+        sendAddressClaim(sourceAddress);
+      } else {
+        // We have the lower NAME — re-assert our claim
+        sendAddressClaim(sourceAddress);
+      }
+    }
+
+    // ---- ISO Request (PGN 59904) ----
+    if (pgn === 59904 && (dst === sourceAddress || dst === 0xFF)) {
+      if (data.length < 3) return;
+      const requestedPgn = data[0] | (data[1] << 8) | (data[2] << 16);
+      if (requestedPgn === 126996) {
+        sendProductInfoResponse();
+      } else if (requestedPgn === 60928) {
+        sendAddressClaim(sourceAddress);
+      } else if (requestedPgn === 130847) {
+        sendPgn130847();
+      } else if (requestedPgn === 126998) {
+        sendPgn126998Response();
+      }
+    }
+  }
+
+  // ===========================================================================
+  // Data transmission
+  // ===========================================================================
 
   function sendOnce(cfg) {
     const payload = buildPayload([cfg]);
     // Payload with only the 2-byte manufacturer header means no data
     if (!payload || payload.length <= PROPRI_HEADER.length) return;
 
-    const ts = new Date().toISOString();
     const priority = cfg.priority || 6;
     const src = cfg.sourceAddress ?? sourceAddress;
     const dst = cfg.destination ?? 255;
-    const hex = Array.from(payload)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join(",");
-    // Send complete payload as one Actisense message;
-    // SimpleCan / canbus driver handles fast-packet framing automatically
-    const msg = `${ts},${priority},130824,${src},${dst},${payload.length},${hex}`;
-    sendN2k(msg);
+
+    if (rawCanChannel) {
+      const canId = computeCanId(130824, priority, src, dst);
+      buildFastPacketFrames(canId, payload).forEach(f => rawCanChannel.send(f));
+    } else {
+      // Fallback: route through canboatjs gateway
+      const ts = new Date().toISOString();
+      const hex = Array.from(payload).map(b => b.toString(16).padStart(2, '0')).join(',');
+      app.emit("nmea2000out", `${ts},${priority},130824,${src},${dst},${payload.length},${hex}`);
+    }
   }
 
-  function sendKeepAlive(src) {
-    const msg = require("util").format(
-      KEEPALIVE_PGN,
-      new Date().toISOString(),
-      src ?? sourceAddress
-    );
-    sendN2k(msg);
+  function sendKeepAlive() {
+    const src = sourceAddress;
+    if (rawCanChannel) {
+      // PGN 65305, priority 7, broadcast — single 8-byte frame (no fast-packet)
+      const canId = computeCanId(65305, 7, src, 0xFF);
+      try { rawCanChannel.send({ id: canId, ext: true, data: KEEPALIVE_DATA }); } catch (e) { app.debug(`sendKeepAlive error: ${e.message}`); }
+    } else {
+      const ts = new Date().toISOString();
+      const hex = Array.from(KEEPALIVE_DATA).map(b => b.toString(16).padStart(2, '0')).join(',');
+      app.emit("nmea2000out", `${ts},7,65305,${src},255,8,${hex}`);
+    }
   }
+
+  // PGN 126993 — Heartbeat (required by NMEA 2000; sent every 60 s)
+  // CAN ID: 0x1DF011[src]  (priority 7, DP=1, PF=0xF0, PS=0x11)
+  // Payload: [60 EA] [seq] [FF FF FF FF FF]  (8 bytes, single frame)
+  function sendHeartbeat() {
+    if (!rawCanChannel) return;
+    const data = Buffer.from([0x60, 0xEA, heartbeatSeq & 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    heartbeatSeq = (heartbeatSeq + 1) & 0xFF;
+    const canId = computeCanId(126993, 7, sourceAddress, 0xFF);
+    try { rawCanChannel.send({ id: canId, ext: true, data }); } catch (e) { app.debug(`sendHeartbeat error: ${e.message}`); }
+  }
+
+  // ===========================================================================
+  // Plugin lifecycle
+  // ===========================================================================
 
   plugin.start = function (options) {
     const cfg = options || {};
-    timers.forEach((t) => clearInterval(t));
+    pluginOptions = cfg;
+
+    timers.forEach(t => clearInterval(t));
     timers = [];
-    
-    // Clean up any existing SimpleCan instance
-    if (simpleCan) {
-      try {
-        simpleCan.stop();
-      } catch (e) {
-        app.debug(`Error stopping SimpleCan: ${e.message}`);
-      }
-      simpleCan = null;
+    if (claimTimer) { clearTimeout(claimTimer); claimTimer = null; }
+
+    if (rawCanChannel) {
+      try { rawCanChannel.stop(); } catch (_) {}
+      rawCanChannel = null;
     }
+    ourNAME = null;
 
     if (!cfg.mappings || cfg.mappings.length === 0) {
-      app.setPluginStatus(
-        plugin.id,
-        "No mappings configured; nothing to send."
-      );
+      app.setPluginStatus(plugin.id, "No mappings configured; nothing to send.");
       return;
     }
 
     sourceAddress = cfg.defaultSourceAddress ?? 14;
 
-    // Initialize H5000 device emulation if enabled
-    if (cfg.emulate === true) {
-      try {
-        const SimpleCan = require("@canboat/canboatjs").SimpleCan;
-        app.debug(`Using device id: ${sourceAddress}`);
-        
-        var canDevice = cfg.candevice;
-        var deviceAddress;
+    function startDataTimers() {
+      cfg.mappings.forEach((map) => {
+        const interval = map.intervalMs || 1000;
+        const sendCfg = {
+          key: map.key,
+          path: map.path,
+          priority: map.priority || 6,
+          destination: map.destination ?? 255,
+          // Per-mapping override only; otherwise sendOnce uses module-level sourceAddress
+          sourceAddress: map.sourceAddress
+        };
+        timers.push(setInterval(() => sendOnce(sendCfg), interval));
+      });
 
-        if (typeof canDevice === "undefined" || canDevice === "") {
-          // Auto-detect CAN device from Signal K providers
-          app.debug("Trying to detect canDevice");
-          if (app.config && app.config.settings && app.config.settings.pipedProviders) {
-            app.config.settings.pipedProviders.forEach(provider => {
-              if (provider.enabled === true && typeof deviceAddress === "undefined") {
-                provider.pipeElements.forEach(element => {
-                  if (element.type === "providers/canbus" && typeof deviceAddress === "undefined") {
-                    app.debug("Found providers/canbus");
-                    if (typeof element.options.canDevice !== "undefined") {
-                      app.debug(`element.options.canDevice: ${element.options.canDevice}`);
-                      canDevice = element.options.canDevice;
-                    }
-                  }
-                });
+      if (cfg.keepAliveEnabled !== false) {
+        timers.push(setInterval(sendKeepAlive, 1000));
+      }
+
+      // PGN 130847 broadcast at 1 Hz — dedicated interval, same pattern as keepalive.
+      // sendPgn130847 guards against rawCanChannel being null.
+      timers.push(setInterval(sendPgn130847, 1000));
+
+      if (rawCanChannel) {
+        // Heartbeat every 60 s — required by NMEA 2000 for all nodes
+        timers.push(setInterval(sendHeartbeat, 60000));
+        // Periodic address re-assertion every 60 s (some devices expect this)
+        timers.push(setInterval(() => sendAddressClaim(sourceAddress), 60000));
+      }
+
+      app.debug(`${plugin.name}: ${timers.length} timer(s) running, src=0x${sourceAddress.toString(16).padStart(2, '0')}`);
+    }
+
+    if (cfg.emulate !== true) {
+      app.setPluginStatus(plugin.id, "Running (emulation disabled)");
+      startDataTimers();
+      app.emit("nmea2000OutAvailable");
+      return;
+    }
+
+    // --- H5000 emulation via raw SocketCAN ---
+
+    // Resolve CAN device name
+    let canDevice = (cfg.candevice || '').trim();
+    if (!canDevice) {
+      if (app.config && app.config.settings && app.config.settings.pipedProviders) {
+        app.config.settings.pipedProviders.forEach(provider => {
+          if (provider.enabled === true && !canDevice) {
+            (provider.pipeElements || []).forEach(element => {
+              if (element.type === "providers/canbus" && !canDevice) {
+                canDevice = (element.options && element.options.canDevice) || '';
               }
             });
           }
-        } else {
-          app.debug(`Using configured canDevice: ${canDevice}`);
-        }
-
-        simpleCan = new SimpleCan({
-          app,
-          canDevice: canDevice,
-          preferredAddress: sourceAddress,
-          transmitPGNs: [126996, 130824],
-          addressClaim: {
-            "Unique Number": 1731561,
-            "Manufacturer Code": "Navico",
-            "Device Function": 190,
-            "Device Class": "Internal Environment",
-            "Device Instance Lower": 0,
-            "Device Instance Upper": 0,
-            "System Instance": 0,
-            "Industry Group": "Marine"
-          },
-          productInfo: {
-            "NMEA 2000 Version": 2100,
-            "Product Code": 246,
-            "Model ID": "H5000 CPU",
-            "Software Version Code": "2.0.45.0.29",
-            "Model Version": "",
-            "Model Serial Code": "005469",
-            "Certification Level": 2,
-            "Load Equivalency": 1
-          }
         });
-
-        simpleCan.start();
-        if (canDevice) {
-          app.setPluginStatus(plugin.id, `H5000 emulation enabled, connected to ${canDevice}`);
-        } else {
-          app.setPluginStatus(plugin.id, "H5000 emulation enabled");
-        }
-        app.debug(`SimpleCan started, device address: ${simpleCan.candevice ? simpleCan.candevice.address : "unknown"}`);
-        deviceAddress = simpleCan.candevice ? simpleCan.candevice.address : sourceAddress;
-        sourceAddress = deviceAddress;
-        
-        // Product Information (PGN 126996) is handled automatically by SimpleCan
-        // via the transmitPGNs configuration — it responds to ISO Requests
-      } catch (e) {
-        app.setPluginError(plugin.id, `Failed to initialize H5000 emulation: ${e.message}`);
-        app.debug(`SimpleCan initialization error: ${e.stack}`);
-        // Continue without emulation
-        simpleCan = null;
       }
+      if (!canDevice) canDevice = 'can0';
     }
 
-    cfg.mappings.forEach((map) => {
-      const interval = map.intervalMs || 1000;
-      const sendCfg = {
-        key: map.key,
-        path: map.path,
-        priority: map.priority || 6,
-        destination: map.destination ?? 255,
-        sourceAddress:
-          map.sourceAddress ??
-          cfg.defaultSourceAddress ??
-          sourceAddress
-      };
-      const t = setInterval(() => sendOnce(sendCfg), interval);
-      timers.push(t);
+    // Try to load socketcan
+    let socketcan;
+    try {
+      socketcan = require('socketcan');
+    } catch (e) {
+      app.debug(`socketcan not available (${e.message}); falling back to app.emit`);
+      app.setPluginStatus(plugin.id, "Warning: socketcan unavailable, emulation disabled");
+      startDataTimers();
+      app.emit("nmea2000OutAvailable");
+      return;
+    }
+
+    // Open raw CAN channel
+    try {
+      rawCanChannel = socketcan.createRawChannel(canDevice, true /* timestamps */);
+      rawCanChannel.addListener('onMessage', handleIncoming);
+      rawCanChannel.start();
+    } catch (e) {
+      app.debug(`Cannot open CAN channel '${canDevice}': ${e.message}`);
+      app.setPluginError(plugin.id, `Cannot open CAN '${canDevice}': ${e.message}`);
+      rawCanChannel = null;
+      startDataTimers();
+      app.emit("nmea2000OutAvailable");
+      return;
+    }
+
+    // Build our 64-bit NAME.  Unique number 1731561 is distinct from the
+    // Teensy's 1448861 so they will never have the same NAME.
+    ourNAME = buildNAME(1731561);
+
+    // Defer the initial address claim by one event-loop tick so the libuv
+    // file-descriptor watcher registered by rawCanChannel.start() is fully
+    // set up before we write to the socket.  Then observe the bus for 250 ms
+    // for competing claims (NMEA 2000 spec) before starting data timers.
+    process.nextTick(() => {
+      sendAddressClaim(sourceAddress);
+      sendHeartbeat();
+
+      claimTimer = setTimeout(() => {
+        claimTimer = null;
+        const addrHex = `0x${sourceAddress.toString(16).padStart(2, '0')}`;
+        app.debug(`Address ${addrHex} claimed on ${canDevice}`);
+        app.setPluginStatus(plugin.id, `H5000 emulation on ${canDevice}, addr ${addrHex}`);
+        startDataTimers();
+        // Broadcast Product Info unsolicited — real H5000 CPU does this on bus join.
+        // Without this the Zeus shows '---' until it happens to send an ISO Request,
+        // which may be too early or never if it already found the device unresponsive.
+        sendProductInfoResponse();
+      }, 250);
     });
 
-    if (cfg.keepAliveEnabled !== false) {
-      // Use 1000ms interval when emulated (matches signalk-bandg-performance-plugin)
-      // Use 2000ms when not emulated
-      const keepAliveInterval = cfg.emulate === true ? 1000 : 2000;
-      timers.push(setInterval(() => sendKeepAlive(sourceAddress), keepAliveInterval));
-    }
-
-    app.emit("nmea2000OutAvailable"); // hint for bridges that we intend to send
-    app.debug(`${plugin.name} started with ${timers.length} mapping timers${cfg.emulate === true ? " (H5000 emulation enabled)" : ""}`);
+    app.emit("nmea2000OutAvailable");
+    app.debug(`${plugin.name}: H5000 emulation started on ${canDevice}, preferred addr 0x${sourceAddress.toString(16).padStart(2, '0')}`);
   };
 
   plugin.stop = function () {
-    timers.forEach((t) => clearInterval(t));
+    timers.forEach(t => clearInterval(t));
     timers = [];
-    if (pathRefreshTimer) {
-      clearInterval(pathRefreshTimer);
-      pathRefreshTimer = null;
+    if (claimTimer) { clearTimeout(claimTimer); claimTimer = null; }
+    if (pathRefreshTimer) { clearInterval(pathRefreshTimer); pathRefreshTimer = null; }
+    if (rawCanChannel) {
+      try { rawCanChannel.stop(); } catch (_) {}
+      rawCanChannel = null;
     }
-    if (simpleCan) {
-      try {
-        simpleCan.stop();
-      } catch (e) {
-        app.debug(`Error stopping SimpleCan: ${e.message}`);
-      }
-      simpleCan = null;
-    }
+    ourNAME = null;
     app.debug(`${plugin.name} stopped`);
   };
 
