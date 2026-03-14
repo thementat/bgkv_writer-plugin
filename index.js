@@ -27,12 +27,13 @@ module.exports = function (app) {
   let pathRefreshTimer = null;
   let rawCanChannel = null;
   let sourceAddress = 14;
-  let seqCounter = 0;
+  let seqCounter = 0;       // shared sequence counter for PGN 130824 / 126996 / 126998
+  let seq130847Counter = 0; // dedicated sequence counter for PGN 130847 (racing + serial)
   let heartbeatSeq = 0;
   let ourNAME = null;
   let pluginOptions = {};
 
-  const KEEPALIVE_DATA = Buffer.from([0x41, 0x9F, 0x01, 0x17, 0x1C, 0x01, 0x00, 0x00]);
+  const KEEPALIVE_DATA = Buffer.from([0x41, 0x9F, 0x01, 0x17, 0x10, 0x01, 0x00, 0x00]);
 
   // PGN 130847 stub payload — Navico header [0x13, 0x99] + 54 × 0xFF = 56 bytes.
   // Pre-computed once; buildFastPacketFrames only reads this buffer (never writes it).
@@ -483,6 +484,47 @@ module.exports = function (app) {
     return frames;
   }
 
+  // Dedicated fast-packet framing for PGN 130847 — uses seq130847Counter so that
+  // the sequence number seen by receivers increments by exactly 1 per 130847 message,
+  // independent of the shared seqCounter used by PGN 130824/126996/126998.
+  function buildFastPacketFrames130847(canId, payload) {
+    const seq = seq130847Counter & 0x07;
+    seq130847Counter = (seq130847Counter + 1) & 0x07;
+    const frames = [];
+
+    const f0 = Buffer.alloc(8, 0xFF);
+    f0[0] = (seq << 5) | 0x00;
+    f0[1] = payload.length;
+    payload.copy(f0, 2, 0, Math.min(6, payload.length));
+    frames.push({ id: canId, ext: true, data: f0 });
+
+    let offset = 6;
+    let frameNum = 1;
+    while (offset < payload.length) {
+      const f = Buffer.alloc(8, 0xFF);
+      f[0] = (seq << 5) | (frameNum & 0x1F);
+      payload.copy(f, 1, offset, Math.min(offset + 7, payload.length));
+      frames.push({ id: canId, ext: true, data: f });
+      offset += 7;
+      frameNum++;
+    }
+
+    return frames;
+  }
+
+  // Send an array of pre-built CAN frames with 1ms spacing between each frame.
+  // Spacing prevents MCP2515 TX FIFO overflow and gives low-priority frames time
+  // to win bus arbitration before the next frame is queued.
+  // Frame 0 is sent immediately (0ms delay); subsequent frames are scheduled at
+  // 1ms, 2ms, 3ms … so a 9-frame message completes in ~8ms.
+  function sendFramesPaced(frames, debugTag) {
+    frames.forEach((frame, i) => {
+      setTimeout(() => {
+        try { rawCanChannel.send(frame); } catch (e) { app.debug(`${debugTag} frame ${i} error: ${e.message}`); }
+      }, i);
+    });
+  }
+
   // ===========================================================================
   // Product Information payload (PGN 126996, 134 bytes)
   // ===========================================================================
@@ -497,7 +539,7 @@ module.exports = function (app) {
     buf.write("2.0.45.0.29", 36, 32, "ascii");            // Software Version
     // bytes 68-99: Model Version — leave as 0xFF (data not available)
     buf.write(serialCode || "005469", 100, 32, "ascii");  // Serial Code
-    buf.writeUInt8(0, 132);                                // Certification Level
+    buf.writeUInt8(2, 132);                                // Certification Level
     buf.writeUInt8(1, 133);                                // Load Equivalency
     return buf;
   }
@@ -525,24 +567,8 @@ module.exports = function (app) {
     const canId = computeCanId(126996, 6, sourceAddress, 0xFF);
     const frames = buildFastPacketFrames(canId, payload);
     app.debug(`Sending Product Info (${frames.length} frames, seq=${frames[0].data[0] >> 5})`);
-
-    // Pace frames with setImmediate so we don't overflow the CAN TX FIFO.
-    // The MCP2515 on PiCAN has a 3-frame hardware TX buffer; sending 20 frames
-    // in a tight loop saturates the kernel TX queue and causes silent drops.
-    // setImmediate latency is <1 ms — well within NMEA 2000 inter-frame limits.
-    function sendNext(idx) {
-      if (idx >= frames.length) {
-        app.debug('Product Info response complete');
-        return;
-      }
-      try {
-        rawCanChannel.send(frames[idx]);
-      } catch (e) {
-        app.debug(`Product Info frame ${idx} send error: ${e.message}`);
-      }
-      setImmediate(() => sendNext(idx + 1));
-    }
-    sendNext(0);
+    // 1ms inter-frame spacing — 20 frames completes in ~19ms, avoiding MCP2515 TX FIFO overflow.
+    sendFramesPaced(frames, 'Product Info');
   }
 
   // PGN 130847 (0x1FF1F) — B&G proprietary sailing/race data.
@@ -550,16 +576,34 @@ module.exports = function (app) {
   // Payload: Navico manufacturer header [0x13, 0x99] + 54 bytes 0xFF = 56 bytes total.
   // Header encoding: mfg_code=275 (Navico), reserved=0b11, industry=4 (Marine)
   //   → 16-bit LE: 275 | (3<<11) | (4<<13) = 0x9913 → bytes [0x13, 0x99]
+  // Priority 7 matches real H5000 CPU captures.
   function sendPgn130847() {
     if (!rawCanChannel) return;
-    const canId = computeCanId(130847, 6, sourceAddress, 0xFF);
-    const frames = buildFastPacketFrames(canId, PGN130847_PAYLOAD);
-    function sendNext(idx) {
-      if (idx >= frames.length) return;
-      try { rawCanChannel.send(frames[idx]); } catch (e) { app.debug(`PGN 130847 frame ${idx} error: ${e.message}`); }
-      setImmediate(() => sendNext(idx + 1));
-    }
-    sendNext(0);
+    const canId = computeCanId(130847, 7, sourceAddress, 0xFF);
+    const frames = buildFastPacketFrames130847(canId, PGN130847_PAYLOAD);
+    sendFramesPaced(frames, 'PGN 130847');
+  }
+
+  // PGN 130847 serial number variant — 12-byte fast-packet broadcast at ~30s intervals.
+  // Payload: [0x13, 0x99] header + type byte 0x09 + 6-byte ASCII serial + 3 × 0xFF padding.
+  // Receivers distinguish this from the 56-byte racing data by the total-length byte (0x0C vs 0x38)
+  // in fast-packet frame 0.  Also sent in response to ISO Requests for PGN 130847.
+  function buildPgn130847SerialPayload(serialNumber) {
+    const buf = Buffer.alloc(12, 0xFF);
+    buf[0] = 0x13;
+    buf[1] = 0x99;
+    buf[2] = 0x09;   // type: H5000 device
+    const serial = (serialNumber || '005469').slice(0, 9);
+    buf.write(serial, 3, serial.length, 'ascii');
+    return buf;
+  }
+
+  function sendPgn130847Serial() {
+    if (!rawCanChannel) return;
+    const payload = buildPgn130847SerialPayload(pluginOptions.serialNumber);
+    const canId = computeCanId(130847, 7, sourceAddress, 0xFF);
+    const frames = buildFastPacketFrames130847(canId, payload);
+    sendFramesPaced(frames, 'PGN 130847 serial');
   }
 
   // PGN 126998 (0x1F016) — NMEA 2000 Config Info.
@@ -569,12 +613,7 @@ module.exports = function (app) {
     const payload = Buffer.alloc(32, 0xFF);
     const canId = computeCanId(126998, 6, sourceAddress, 0xFF);
     const frames = buildFastPacketFrames(canId, payload);
-    function sendNext(idx) {
-      if (idx >= frames.length) return;
-      try { rawCanChannel.send(frames[idx]); } catch (e) { app.debug(`PGN 126998 frame ${idx} error: ${e.message}`); }
-      setImmediate(() => sendNext(idx + 1));
-    }
-    sendNext(0);
+    sendFramesPaced(frames, 'PGN 126998');
   }
 
   function handleIncoming(msg) {
@@ -612,7 +651,7 @@ module.exports = function (app) {
       } else if (requestedPgn === 60928) {
         sendAddressClaim(sourceAddress);
       } else if (requestedPgn === 130847) {
-        sendPgn130847();
+        sendPgn130847Serial();   // ISO Request response uses 12-byte serial variant
       } else if (requestedPgn === 126998) {
         sendPgn126998Response();
       }
@@ -634,7 +673,7 @@ module.exports = function (app) {
 
     if (rawCanChannel) {
       const canId = computeCanId(130824, priority, src, dst);
-      buildFastPacketFrames(canId, payload).forEach(f => rawCanChannel.send(f));
+      sendFramesPaced(buildFastPacketFrames(canId, payload), 'PGN 130824');
     } else {
       // Fallback: route through canboatjs gateway
       const ts = new Date().toISOString();
@@ -710,9 +749,11 @@ module.exports = function (app) {
         timers.push(setInterval(sendKeepAlive, 1000));
       }
 
-      // PGN 130847 broadcast at 1 Hz — dedicated interval, same pattern as keepalive.
+      // PGN 130847 racing data at 1 Hz — dedicated interval, same pattern as keepalive.
       // sendPgn130847 guards against rawCanChannel being null.
       timers.push(setInterval(sendPgn130847, 1000));
+      // PGN 130847 serial number variant at 30 s — matches real H5000 behaviour.
+      timers.push(setInterval(sendPgn130847Serial, 30000));
 
       if (rawCanChannel) {
         // Heartbeat every 60 s — required by NMEA 2000 for all nodes
