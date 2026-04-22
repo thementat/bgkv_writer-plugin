@@ -32,6 +32,11 @@ module.exports = function (app) {
   let heartbeatSeq = 0;
   let ourNAME = null;
   let pluginOptions = {};
+  // Per-(path, sourceFilter) latest-value cache, fed by the delta listener below.
+  // Keyed as `${path}||${sourceFilter}`; only mappings with a non-empty sourceFilter
+  // read from this cache, everything else reads via app.getSelfPath.
+  const filteredValues = new Map();
+  let deltaListener = null;
 
   const KEEPALIVE_DATA = Buffer.from([0x41, 0x9F, 0x01, 0x17, 0x10, 0x01, 0x00, 0x00]);
 
@@ -288,6 +293,12 @@ module.exports = function (app) {
               sourceAddress: {
                 type: "number",
                 title: "Source address override (optional)"
+              },
+              sourceFilter: {
+                type: "string",
+                title: "Ingest only this $source (optional)",
+                description: "When set (e.g. \"sources-plugin\" or \"sailprocessor.calibrated\"), the plugin reads this mapping from deltas whose $source matches. Leave empty to use the server's default source resolution.",
+                default: ""
               }
             }
           }
@@ -340,19 +351,27 @@ module.exports = function (app) {
   // Bit layout: [mfg_code:11][reserved:2][industry:3] = 0x7D 0x99
   const PROPRI_HEADER = [0x7d, 0x99];
 
+  function readMappingValue(map, def) {
+    const path = map.path || def.defaultPath;
+    const filter = (map.sourceFilter || "").trim();
+    if (filter) {
+      const cached = filteredValues.get(`${path}||${filter}`);
+      return cached === undefined ? null : cached;
+    }
+    const skVal = app.getSelfPath ? app.getSelfPath(path) : null;
+    return skVal && typeof skVal === "object" && skVal.value != null
+      ? skVal.value
+      : skVal;
+  }
+
   function buildPayload(mappings) {
     const bytes = [...PROPRI_HEADER];
+    let appendedAny = false;
 
     mappings.forEach((map) => {
       const def = KEY_DEFS.find((d) => d.key === map.key);
       if (!def) return;
-      const skVal = app.getSelfPath
-        ? app.getSelfPath(map.path || def.defaultPath)
-        : null;
-      const val =
-        skVal && typeof skVal === "object" && skVal.value != null
-          ? skVal.value
-          : skVal;
+      const val = readMappingValue(map, def);
       const converted = toPluginUnits(map.path || def.defaultPath, val);
       if (converted == null || Number.isNaN(converted)) return;
 
@@ -364,7 +383,13 @@ module.exports = function (app) {
       const header = (def.key & 0xfff) | ((len & 0x0f) << 12);
       bytes.push(header & 0xff, (header >> 8) & 0xff);
       bytes.push(...valueBytes);
+      appendedAny = true;
     });
+
+    if (!appendedAny) {
+      // Nothing to send — signal empty to callers so they can skip emission entirely.
+      return null;
+    }
 
     // PGN 130824 is always a fast-packet PGN — pad to guarantee > 8 bytes
     // so receivers don't confuse it for a single-frame message.
@@ -664,8 +689,8 @@ module.exports = function (app) {
 
   function sendOnce(cfg) {
     const payload = buildPayload([cfg]);
-    // Payload with only the 2-byte manufacturer header means no data
-    if (!payload || payload.length <= PROPRI_HEADER.length) return;
+    // buildPayload returns null when no mapping contributed a value
+    if (!payload) return;
 
     const priority = cfg.priority || 6;
     const src = cfg.sourceAddress ?? sourceAddress;
@@ -731,12 +756,52 @@ module.exports = function (app) {
 
     sourceAddress = cfg.defaultSourceAddress ?? 14;
 
+    // Wire a delta listener if any mapping specifies a sourceFilter.
+    // Updates the filteredValues cache keyed by `${path}||${sourceFilter}`.
+    const filterMappings = (cfg.mappings || []).filter(
+      (m) => m && typeof m.sourceFilter === "string" && m.sourceFilter.trim().length > 0
+    );
+    filteredValues.clear();
+    if (deltaListener && app && app.signalk && typeof app.signalk.removeListener === "function") {
+      try { app.signalk.removeListener("delta", deltaListener); } catch (_) {}
+      deltaListener = null;
+    }
+    if (filterMappings.length > 0 && app && app.signalk && typeof app.signalk.on === "function") {
+      // Index filters by path so we can look up the wanted source labels per-delta.
+      const wantByPath = new Map();
+      filterMappings.forEach((m) => {
+        const key = m.path || (KEY_DEFS.find((d) => d.key === m.key) || {}).defaultPath;
+        if (!key) return;
+        const filt = m.sourceFilter.trim();
+        if (!wantByPath.has(key)) wantByPath.set(key, new Set());
+        wantByPath.get(key).add(filt);
+      });
+      deltaListener = function onDelta(delta) {
+        if (!delta || !Array.isArray(delta.updates)) return;
+        for (const upd of delta.updates) {
+          const label = upd.$source || (upd.source && upd.source.label);
+          if (!label) continue;
+          if (!Array.isArray(upd.values)) continue;
+          for (const v of upd.values) {
+            if (!v || !v.path) continue;
+            const wanted = wantByPath.get(v.path);
+            if (!wanted || !wanted.has(label)) continue;
+            const raw = v.value;
+            const extracted = raw && typeof raw === "object" && raw.value != null ? raw.value : raw;
+            filteredValues.set(`${v.path}||${label}`, extracted);
+          }
+        }
+      };
+      app.signalk.on("delta", deltaListener);
+    }
+
     function startDataTimers() {
       cfg.mappings.forEach((map) => {
         const interval = map.intervalMs || 1000;
         const sendCfg = {
           key: map.key,
           path: map.path,
+          sourceFilter: map.sourceFilter,
           priority: map.priority || 6,
           destination: map.destination ?? 255,
           // Per-mapping override only; otherwise sendOnce uses module-level sourceAddress
@@ -855,6 +920,11 @@ module.exports = function (app) {
       try { rawCanChannel.stop(); } catch (_) {}
       rawCanChannel = null;
     }
+    if (deltaListener && app && app.signalk && typeof app.signalk.removeListener === "function") {
+      try { app.signalk.removeListener("delta", deltaListener); } catch (_) {}
+    }
+    deltaListener = null;
+    filteredValues.clear();
     ourNAME = null;
     app.debug(`${plugin.name} stopped`);
   };
