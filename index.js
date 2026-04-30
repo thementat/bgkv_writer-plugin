@@ -45,6 +45,22 @@ module.exports = function (app) {
   const PGN130847_PAYLOAD = Buffer.concat([Buffer.from([0x13, 0x99]), Buffer.alloc(54, 0xFF)]);
 
   // scale = physical units per raw integer (raw * scale => value)
+  //
+  // bearing: true marks keys whose H5000 wire format is signed int16 in
+  // [-π, π) but whose Signal K canonical path uses [0, 2π). buildPayload
+  // applies wrapPi before encoding for these.
+  //
+  // TODO(bearing-keys): keys 80, 105, 109, 311 are flagged. The following
+  // are also bearing-semantic and saturate to 0x7FFF for any value ≥ ~187.7°,
+  // but were left unflagged pending confirmation that the H5000 signed-wire
+  // convention applies to each: 154 (Heading on Opposite Tack), 211 (DR
+  // Bearing), 233 (COG, defaultPath navigation.courseOverGroundTrue —
+  // structurally identical to 109), 272 (Start Line Bearing), 306 (Opposite
+  // Tack COG), 307 (Opposite Tack Target HDG), 309 (Next Leg Bearing), 336
+  // (Avg True Wind Direction, redundant with 80), 384 (Pilot Net Course).
+  // The reader's KEY_MAP must gain matching `bearing: true` entries when these
+  // are added — without the inverse wrap on decode, downstream SK consumers
+  // see negative bearings on the [-π, π) scale instead of [0, 2π).
   const KEY_DEFS = [
     { key: 0, name: "Altitude", scale: 1, bytes: 2, signed: true },
     { key: 11, name: "Rudder Angle", scale: 0.0001, bytes: 2, signed: true, defaultPath: "steering.rudderAngle" },
@@ -76,7 +92,7 @@ module.exports = function (app) {
     { key: 65, name: "Water Speed", scale: 0.01, bytes: 2, signed: false, defaultPath: "navigation.speedThroughWater" },
     { key: 77, name: "Wind Speed Apparent", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedApparent" },
     { key: 79, name: "Wind Speed Apparent 2", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedApparent" },
-    { key: 80, name: "Avg True Wind Dir", scale: 0.0001, bytes: 2, signed: true },
+    { key: 80, name: "Avg True Wind Dir", scale: 0.0001, bytes: 2, signed: true, bearing: true },
     { key: 81, name: "Wind Angle Apparent", scale: 0.0001, bytes: 2, signed: true, defaultPath: "environment.wind.angleApparent" },
     { key: 83, name: "Target TWA", scale: 0.0001, bytes: 2, signed: true },
     { key: 85, name: "Wind Speed True", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedTrue" },
@@ -86,8 +102,8 @@ module.exports = function (app) {
     { key: 102, name: "Keel Angle", scale: 0.0001, bytes: 2, signed: true },
     { key: 103, name: "Canard Angle", scale: 0.0001, bytes: 2, signed: true },
     { key: 104, name: "Keel Trim Tab Angle", scale: 0.0001, bytes: 2, signed: true },
-    { key: 105, name: "Course / Heading", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.headingTrue" },
-    { key: 109, name: "Wind Direction", scale: 0.0001, bytes: 2, signed: true, defaultPath: "environment.wind.directionTrue" },
+    { key: 105, name: "Course / Heading", scale: 0.0001, bytes: 2, signed: true, bearing: true, defaultPath: "navigation.headingTrue" },
+    { key: 109, name: "Wind Direction", scale: 0.0001, bytes: 2, signed: true, bearing: true, defaultPath: "environment.wind.directionTrue" },
     { key: 111, name: "Next Leg AWA", scale: 0.0001, bytes: 2, signed: true },
     { key: 113, name: "Next Leg AWS", scale: 0.01, bytes: 2, signed: false },
     { key: 117, name: "Race Timer", scale: 0.001, bytes: 4, signed: true },
@@ -167,7 +183,7 @@ module.exports = function (app) {
     { key: 308, name: "Mast Rake", scale: 0.0001, bytes: 2, signed: true },
     { key: 309, name: "Next Leg Bearing", scale: 0.0001, bytes: 2, signed: true },
     { key: 310, name: "Next Leg Target Speed", scale: 0.01, bytes: 2, signed: true },
-    { key: 311, name: "Ground Wind Direction", scale: 0.0001, bytes: 2, signed: true },
+    { key: 311, name: "Ground Wind Direction", scale: 0.0001, bytes: 2, signed: true, bearing: true },
     { key: 312, name: "Ground Wind Speed", scale: 0.01, bytes: 2, signed: true },
     { key: 313, name: "Mast Cant Angle", scale: 0.0001, bytes: 2, signed: true },
     { key: 314, name: "Rudder Toe In", scale: 0.0001, bytes: 2, signed: true },
@@ -329,6 +345,12 @@ module.exports = function (app) {
   // ===========================================================================
 
   function encodeNumber(val, bytes, signed) {
+    // Reject non-finite inputs. Math.round(Infinity) === Infinity and
+    // Math.min(32767, Infinity) === 32767, so without this guard a non-finite
+    // value silently encodes to the SINT16 "data not available" sentinel
+    // (0xFF 0x7F) — receivers fall back to last-good and the displayed value
+    // sticks. A null return signals the caller to drop the mapping for this tick.
+    if (!Number.isFinite(val)) return null;
     const bits = bytes * 8;
     const max = signed ? (2 ** (bits - 1)) - 1 : (2 ** bits) - 1;
     const min = signed ? -(2 ** (bits - 1)) : 0;
@@ -340,6 +362,14 @@ module.exports = function (app) {
       tmp = Math.floor(tmp / 256);
     }
     return out;
+  }
+
+  // Wrap a bearing in [0, 2π) (Signal K convention) into [-π, π) (B&G H5000
+  // signed-int16 internal convention). Required for bearing-flagged KEY_DEFS
+  // before encoding — without it, any bearing ≥ ~187.7° saturates at 0x7FFF.
+  function wrapPi(rad) {
+    const TWO_PI = 2 * Math.PI;
+    return ((rad + Math.PI) % TWO_PI + TWO_PI) % TWO_PI - Math.PI;
   }
 
   function toPluginUnits(path, value) {
@@ -359,9 +389,13 @@ module.exports = function (app) {
       return cached === undefined ? null : cached;
     }
     const skVal = app.getSelfPath ? app.getSelfPath(path) : null;
-    return skVal && typeof skVal === "object" && skVal.value != null
-      ? skVal.value
-      : skVal;
+    if (skVal == null) return null;
+    if (typeof skVal === "object") {
+      // SK can surface { value: null, timestamp: ... } when a path is
+      // declared but no value has been published. Return null, not the wrapper.
+      return skVal.value != null ? skVal.value : null;
+    }
+    return skVal;
   }
 
   function buildPayload(mappings) {
@@ -375,8 +409,17 @@ module.exports = function (app) {
       const converted = toPluginUnits(map.path || def.defaultPath, val);
       if (converted == null || Number.isNaN(converted)) return;
 
-      const raw = converted / def.scale;
+      // Bearing keys (e.g. 109 Wind Direction, 105 Heading) use signed int16
+      // representing [-π, π). Signal K bearings are [0, 2π) — wrap before
+      // scaling so values ≥ π don't saturate to the 0x7FFF "no data" sentinel.
+      let valueForEncode = converted;
+      if (def.bearing) valueForEncode = wrapPi(valueForEncode);
+
+      const raw = valueForEncode / def.scale;
       const valueBytes = encodeNumber(raw, def.bytes, def.signed);
+      // encodeNumber returns null for non-finite input — skip silently rather
+      // than emit a bogus SINT sentinel that receivers misinterpret.
+      if (valueBytes === null) return;
 
       // Pack 12-bit key + 4-bit length
       const len = valueBytes.length;
