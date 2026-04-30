@@ -42,8 +42,12 @@ module.exports = function (app) {
     }
   };
 
-  // Known key mapping: key -> { path, scale, bytes, signed, unitNote }
+  // Known key mapping: key -> { path, scale, bytes, signed, bearing?, unitNote }
   // scale is applied as raw * scale (e.g., 0.0001 for rad in 1e-4)
+  // bearing: keys whose H5000 wire encoding is signed int16 in [-π, π) but
+  // whose Signal K canonical path uses [0, 2π). The reader applies
+  // (value + 2π) mod 2π after scaling for these. The writer applies the
+  // inverse wrap before encoding.
   const KEY_MAP = new Map([
     // Wind
     [77,  { path: 'environment.wind.speedApparent', scale: 0.01,  bytes: 2, signed: false }],
@@ -52,13 +56,13 @@ module.exports = function (app) {
     [85,  { path: 'environment.wind.speedTrue',     scale: 0.01,  bytes: 2, signed: false }],
     [86,  { path: 'environment.wind.speedTrue',     scale: 0.01,  bytes: 2, signed: false }],
     [89,  { path: 'environment.wind.angleTrueWater',scale: 0.0001, bytes: 2, signed: true }],
-    [109, { path: 'environment.wind.directionTrue', scale: 0.0001, bytes: 2, signed: true }],
+    [109, { path: 'environment.wind.directionTrue', scale: 0.0001, bytes: 2, signed: true, bearing: true }],
 
     // Speed / Course
     [65,  { path: 'navigation.speedThroughWater',   scale: 0.01,  bytes: 2, signed: false }],
     [235, { path: 'navigation.speedOverGround',     scale: 0.01,  bytes: 2, signed: false }],
     [233, { path: 'navigation.courseOverGroundTrue',scale: 0.0001, bytes: 2, signed: true }],
-    [105, { path: 'navigation.headingTrue',         scale: 0.0001, bytes: 2, signed: true }],
+    [105, { path: 'navigation.headingTrue',         scale: 0.0001, bytes: 2, signed: true, bearing: true }],
 
     // Temperatures (Signal K uses Kelvin)
     [28,  { path: 'environment.outside.temperature', scale: 0.01, bytes: 2, signed: false }],
@@ -287,7 +291,12 @@ module.exports = function (app) {
 
         // Only decode numeric types here per our map
         const raw = decodeNumber(bytes, map.bytes, map.signed);
-        const value = raw * map.scale;
+        let value = raw * map.scale;
+        if (map.bearing) {
+          // Wire format is signed [-π, π); Signal K canonical bearings are [0, 2π).
+          const TWO_PI = 2 * Math.PI;
+          value = ((value % TWO_PI) + TWO_PI) % TWO_PI;
+        }
 
         outValues.push({ path: map.path, value });
       });
