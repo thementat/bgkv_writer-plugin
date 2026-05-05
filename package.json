@@ -1,12 +1,12 @@
 {
   "name": "bgkv_writer-plugin",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Signal K plugin to encode B&G PGN 130824 key/value data from Signal K paths",
   "main": "index.js",
   "scripts": {
     "test": "jest"
   },
-  "keywords": ["signalk-node-server-plugin","signalk", "plugin", "n2k", "b&g", "proprietary", "130824"],
+  "keywords": ["signalk-node-server-plugin","signalk", "plugin", "n2k", "b&g", "proprietary", "130824", "130306", "wind"],
   "author": "",
   "license": "ISC",
   "dependencies": {

@@ -230,6 +230,12 @@ module.exports = function (app) {
       type: "object",
       required: ["mappings"],
       properties: {
+        emitWindPgn130306: {
+          type: "boolean",
+          title: "Emit standard wind PGN 130306 (apparent wind)",
+          description: "When enabled, transmits back-calculated AWA/AWS from sailprocessor as PGN 130306 (reference=Apparent) at 10 Hz from the H5000 emulator address. Requires emulation enabled.",
+          default: false
+        },
         emulate: {
           type: "boolean",
           title: "Enable B&G H5000 device emulation (required for Triton recognition)",
@@ -774,6 +780,78 @@ module.exports = function (app) {
     try { rawCanChannel.send({ id: canId, ext: true, data }); } catch (e) { app.debug(`sendHeartbeat error: ${e.message}`); }
   }
 
+  // PGN 130306 — Wind Data (single 8-byte frame, NOT fast-packet).
+  // SID rolls 0..252; 0xFF is reserved as the "data not available" sentinel.
+  let pgn130306Sid = 0;
+  let pgn130306DebugLogged = false;
+
+  function buildPgn130306Payload(awaRad, awsMps, referenceCode) {
+    const buf = Buffer.alloc(8, 0xFF);
+    buf[0] = pgn130306Sid & 0xFF;
+    pgn130306Sid = (pgn130306Sid + 1) % 253;
+
+    if (Number.isFinite(awsMps) && awsMps >= 0) {
+      const ws = Math.round(awsMps * 100);
+      buf.writeUInt16LE(Math.max(0, Math.min(0xFFFE, ws)), 1);
+    } else {
+      buf.writeUInt16LE(0xFFFF, 1);
+    }
+
+    // Wind angle wire format is unsigned [0, 2π); SK publishes signed ±π
+    // (atan2 output) so wrap before scaling — anything else would fail to round-trip.
+    if (Number.isFinite(awaRad)) {
+      const TWO_PI = Math.PI * 2;
+      let a = awaRad % TWO_PI;
+      if (a < 0) a += TWO_PI;
+      const waRaw = Math.round(a * 10000);
+      buf.writeUInt16LE(Math.max(0, Math.min(0xFFFE, waRaw)), 3);
+    } else {
+      buf.writeUInt16LE(0xFFFF, 3);
+    }
+
+    buf[5] = (referenceCode & 0x07) | 0xF8;
+    return buf;
+  }
+
+  function sendPgn130306Apparent() {
+    let awa = NaN, aws = NaN;
+    try {
+      const awaNode = app.getSelfPath ? app.getSelfPath('environment.wind.angleApparent') : null;
+      const awsNode = app.getSelfPath ? app.getSelfPath('environment.wind.speedApparent') : null;
+      const awaVal = awaNode && typeof awaNode === 'object' ? awaNode.value : awaNode;
+      const awsVal = awsNode && typeof awsNode === 'object' ? awsNode.value : awsNode;
+      if (awaVal != null) awa = Number(awaVal);
+      if (awsVal != null) aws = Number(awsVal);
+    } catch (e) {
+      app.debug(`PGN 130306 read error: ${e.message}`);
+      return;
+    }
+
+    // No wind available — leave the WS310's frames as-is rather than claiming
+    // the PGN slot with all-0xFFFF data, which can displace it in receivers.
+    if (!Number.isFinite(awa) && !Number.isFinite(aws)) return;
+
+    const payload = buildPgn130306Payload(awa, aws, 2 /* apparent */);
+    const canId = computeCanId(130306, 2 /* priority */, sourceAddress, 0xFF);
+
+    if (!pgn130306DebugLogged) {
+      app.debug(`PGN 130306 first send: canId=0x${canId.toString(16).toUpperCase().padStart(8, '0')}, src=0x${sourceAddress.toString(16).padStart(2, '0')}`);
+      pgn130306DebugLogged = true;
+    }
+
+    if (rawCanChannel) {
+      try {
+        rawCanChannel.send({ id: canId, ext: true, data: payload });
+      } catch (e) {
+        app.debug(`sendPgn130306Apparent error: ${e.message}`);
+      }
+    } else {
+      const ts = new Date().toISOString();
+      const hex = Array.from(payload).map(b => b.toString(16).padStart(2, '0')).join(',');
+      app.emit("nmea2000out", `${ts},2,130306,${sourceAddress},255,8,${hex}`);
+    }
+  }
+
   // ===========================================================================
   // Plugin lifecycle
   // ===========================================================================
@@ -863,6 +941,13 @@ module.exports = function (app) {
       // PGN 130847 serial number variant at 30 s — matches real H5000 behaviour.
       timers.push(setInterval(sendPgn130847Serial, 30000));
 
+      if (cfg.emitWindPgn130306 === true) {
+        pgn130306DebugLogged = false;
+        // 10 Hz to match the WS310's native rate
+        timers.push(setInterval(sendPgn130306Apparent, 100));
+        app.debug('PGN 130306 (Apparent Wind) emission enabled at 10 Hz');
+      }
+
       if (rawCanChannel) {
         // Heartbeat every 60 s — required by NMEA 2000 for all nodes
         timers.push(setInterval(sendHeartbeat, 60000));
@@ -870,11 +955,13 @@ module.exports = function (app) {
         timers.push(setInterval(() => sendAddressClaim(sourceAddress), 60000));
       }
 
-      app.debug(`${plugin.name}: ${timers.length} timer(s) running, src=0x${sourceAddress.toString(16).padStart(2, '0')}`);
+      const wind130306Note = cfg.emitWindPgn130306 === true ? ', PGN 130306 wind on' : '';
+      app.debug(`${plugin.name}: ${timers.length} timer(s) running, src=0x${sourceAddress.toString(16).padStart(2, '0')}${wind130306Note}`);
     }
 
     if (cfg.emulate !== true) {
-      app.setPluginStatus(plugin.id, "Running (emulation disabled)");
+      const wind130306Note = cfg.emitWindPgn130306 === true ? " + PGN 130306" : "";
+      app.setPluginStatus(plugin.id, `Running (emulation disabled)${wind130306Note}`);
       startDataTimers();
       app.emit("nmea2000OutAvailable");
       return;
@@ -941,7 +1028,8 @@ module.exports = function (app) {
         claimTimer = null;
         const addrHex = `0x${sourceAddress.toString(16).padStart(2, '0')}`;
         app.debug(`Address ${addrHex} claimed on ${canDevice}`);
-        app.setPluginStatus(plugin.id, `H5000 emulation on ${canDevice}, addr ${addrHex}`);
+        const wind130306Note = cfg.emitWindPgn130306 === true ? " + PGN 130306" : "";
+        app.setPluginStatus(plugin.id, `H5000 emulation on ${canDevice}, addr ${addrHex}${wind130306Note}`);
         startDataTimers();
         // Broadcast Product Info unsolicited — real H5000 CPU does this on bus join.
         // Without this the Zeus shows '---' until it happens to send an ISO Request,
@@ -971,6 +1059,10 @@ module.exports = function (app) {
     ourNAME = null;
     app.debug(`${plugin.name} stopped`);
   };
+
+  // Test-only: lets the test suite drive the encoder + SID counter without
+  // standing up the full timer machinery.
+  plugin._buildPgn130306Payload = buildPgn130306Payload;
 
   return plugin;
 };
