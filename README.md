@@ -1,4 +1,4 @@
-# bgkv_writer-plugin
+# @salishseasystems/signalk-bgkv-writer
 
 Signal K plugin that encodes local values into B&G proprietary PGN 130824
 (key/value) and transmits them on the NMEA 2000 bus, with optional H5000
@@ -48,6 +48,6 @@ source address, defeating the purpose.
 ## Testing
 
 ```
-cd ~/.signalk/node_modules/bgkv_writer-plugin
+cd ~/.signalk/node_modules/@salishseasystems/signalk-bgkv-writer
 npm test
 ```
