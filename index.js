@@ -14,7 +14,7 @@
 module.exports = function (app) {
   const plugin = {};
 
-  plugin.id = 'bgkv_reader-plugin';
+  plugin.id = 'bgkv-reader';
   plugin.name = 'B&G Key/Value Reader (PGN 130824)';
   plugin.description = 'Decodes B&G proprietary key/value PGN 130824 into Signal K paths.';
 
