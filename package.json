@@ -1,5 +1,5 @@
 {
-  "name": "bgkv_reader-plugin",
+  "name": "@salishseasystems/signalk-bgkv-reader",
   "version": "1.0.0",
   "description": "Signal K plugin to decode B&G PGN 130824 key/value data to Signal K paths",
   "main": "index.js",
