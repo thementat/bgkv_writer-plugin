@@ -23,7 +23,7 @@ function waitMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-describe('bgkv_writer-plugin — canonical paths + sourceFilter', () => {
+describe('bgkv-writer — canonical paths + sourceFilter', () => {
   afterEach(() => {
     jest.useRealTimers();
   });

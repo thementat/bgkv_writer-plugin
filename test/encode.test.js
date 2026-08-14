@@ -67,7 +67,7 @@ function wrapTwoPi(rad) {
   return ((rad % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
 }
 
-describe('bgkv_writer-plugin — encodeNumber non-finite handling (post-fix)', () => {
+describe('bgkv-writer — encodeNumber non-finite handling (post-fix)', () => {
   afterEach(() => {
     jest.useRealTimers();
   });
@@ -133,7 +133,7 @@ describe('bgkv_writer-plugin — encodeNumber non-finite handling (post-fix)', (
   });
 });
 
-describe('bgkv_writer-plugin — bearing wrap on PGN 130824 keys (post-fix)', () => {
+describe('bgkv-writer — bearing wrap on PGN 130824 keys (post-fix)', () => {
   afterEach(() => {
     jest.useRealTimers();
   });
