@@ -1,8 +1,15 @@
 "use strict";
 
 /*
-  Signal K Plugin: B&G Key/Value Writer (PGN 130824)
+  Signal K Plugin: B&G Key/Value (PGN 130824)
 
+  Bidirectional B&G proprietary key/value plugin, formed by merging the former
+  signalk-bgkv-writer and signalk-bgkv-reader plugins. Both halves share one
+  KEY_DEFS table, so the encode and decode sides can no longer disagree about a
+  key's scale, width, signedness or bearing convention — the drift that table
+  duplication used to allow.
+
+  Encode side (enableWriter, default on):
   Encodes B&G proprietary key/value PGN 130824 from selected Signal K paths.
   Each mapping can have its own send interval, priority, and destination.
   Values are packed into fast-packet frames and sent via raw SocketCAN or
@@ -11,15 +18,22 @@
   When emulate=true, the plugin claims its own NMEA 2000 address as an
   "H5000 CPU" device using a raw SocketCAN socket, completely independent of
   the canboatjs gateway that SignalK already runs on can0.
+
+  Decode side (enableReader, default off):
+  Parses fast-packet PGN 130824 off the server's N2K JSON stream and emits
+  Signal K deltas for the keys marked `read: true` in KEY_DEFS. When the
+  encode side is also running it suppresses our own transmissions by source
+  address — a self-echo guard the standalone reader could not implement,
+  because it had no way to learn which address the writer had claimed.
 */
 
 module.exports = function (app) {
   const plugin = {};
 
-  plugin.id = "bgkv-writer";
-  plugin.name = "SSS: B&G Key/Value Writer (PGN 130824)";
+  plugin.id = "bgkv";
+  plugin.name = "SSS: B&G Key/Value (PGN 130824)";
   plugin.description =
-    "Encodes Signal K values into B&G proprietary key/value PGN 130824";
+    "Encodes Signal K values into, and decodes them out of, B&G proprietary key/value PGN 130824";
 
   let timers = [];
   let claimTimer = null;
@@ -38,6 +52,12 @@ module.exports = function (app) {
   const filteredValues = new Map();
   let deltaListener = null;
 
+  // Decode-side state. fpBuffers holds partial fast-packet reassembly keyed
+  // `src:pgn`; writerActive gates the self-echo guard in handlePgn130824.
+  const fpBuffers = new Map();
+  let n2kUnsubscribe = [];
+  let writerActive = false;
+
   const KEEPALIVE_DATA = Buffer.from([0x41, 0x9F, 0x01, 0x17, 0x10, 0x01, 0x00, 0x00]);
 
   // PGN 130847 stub payload — Navico header [0x13, 0x99] + 54 × 0xFF = 56 bytes.
@@ -48,7 +68,12 @@ module.exports = function (app) {
   //
   // bearing: true marks keys whose H5000 wire format is signed int16 in
   // [-π, π) but whose Signal K canonical path uses [0, 2π). buildPayload
-  // applies wrapPi before encoding for these.
+  // applies wrapPi before encoding for these, and handlePgn130824 applies the
+  // inverse (mod 2π) on decode. One flag now drives both directions.
+  //
+  // read: true marks keys the decode side publishes to defaultPath when it
+  // sees them on the bus. Encoding is driven by user mappings and needs no
+  // flag; decoding has no per-key UI, so this is the whole decode key set.
   //
   // TODO(bearing-keys): keys 80, 105, 109, 311 are flagged. The following
   // are also bearing-semantic and saturate to 0x7FFF for any value ≥ ~187.7°,
@@ -58,9 +83,9 @@ module.exports = function (app) {
   // structurally identical to 109), 272 (Start Line Bearing), 306 (Opposite
   // Tack COG), 307 (Opposite Tack Target HDG), 309 (Next Leg Bearing), 336
   // (Avg True Wind Direction, redundant with 80), 384 (Pilot Net Course).
-  // The reader's KEY_MAP must gain matching `bearing: true` entries when these
-  // are added — without the inverse wrap on decode, downstream SK consumers
-  // see negative bearings on the [-π, π) scale instead of [0, 2π).
+  // Since the merge there is one table: adding `bearing: true` to a row fixes
+  // the encode and decode sides together, and the round-trip test in
+  // test/roundtrip.test.js covers every bearing-flagged key automatically.
   const KEY_DEFS = [
     { key: 0, name: "Altitude", scale: 1, bytes: 2, signed: true },
     { key: 11, name: "Rudder Angle", scale: 0.0001, bytes: 2, signed: true, defaultPath: "steering.rudderAngle" },
@@ -76,34 +101,34 @@ module.exports = function (app) {
     { key: 25, name: "User 14", scale: 0.01, bytes: 4, signed: true },
     { key: 26, name: "User 15", scale: 0.01, bytes: 4, signed: true },
     { key: 27, name: "User 16", scale: 0.01, bytes: 4, signed: true },
-    { key: 28, name: "Outside Temp 1", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.outside.temperature" },
-    { key: 29, name: "Outside Temp 2", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.outside.temperature" },
-    { key: 30, name: "Water Temp 1", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.water.temperature" },
-    { key: 31, name: "Water Temp 2", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.water.temperature" },
+    { key: 28, name: "Outside Temp 1", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.outside.temperature", read: true },
+    { key: 29, name: "Outside Temp 2", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.outside.temperature", read: true },
+    { key: 30, name: "Water Temp 1", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.water.temperature", read: true },
+    { key: 31, name: "Water Temp 2", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.water.temperature", read: true },
     { key: 50, name: "Tacking Performance", scale: 0.1, bytes: 2, signed: true },
-    { key: 52, name: "Attitude Roll", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.attitude.roll" },
+    { key: 52, name: "Attitude Roll", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.attitude.roll", read: true },
     { key: 53, name: "Optimum Wind Angle", scale: 0.0001, bytes: 2, signed: true },
     { key: 56, name: "User 1", scale: 0.01, bytes: 4, signed: true },
     { key: 57, name: "User 2", scale: 0.01, bytes: 4, signed: true },
     { key: 58, name: "User 3", scale: 0.01, bytes: 4, signed: true },
     { key: 59, name: "User 4", scale: 0.01, bytes: 4, signed: true },
-    { key: 60, name: "Roll Rate", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.rateOfTurn" },
+    { key: 60, name: "Roll Rate", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.rateOfTurn", read: true },
     { key: 64, name: "Forestay", scale: 0.001, bytes: 4, signed: false },
-    { key: 65, name: "Water Speed", scale: 0.01, bytes: 2, signed: false, defaultPath: "navigation.speedThroughWater" },
-    { key: 77, name: "Wind Speed Apparent", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedApparent" },
-    { key: 79, name: "Wind Speed Apparent 2", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedApparent" },
+    { key: 65, name: "Water Speed", scale: 0.01, bytes: 2, signed: false, defaultPath: "navigation.speedThroughWater", read: true },
+    { key: 77, name: "Wind Speed Apparent", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedApparent", read: true },
+    { key: 79, name: "Wind Speed Apparent 2", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedApparent", read: true },
     { key: 80, name: "Avg True Wind Dir", scale: 0.0001, bytes: 2, signed: true, bearing: true },
-    { key: 81, name: "Wind Angle Apparent", scale: 0.0001, bytes: 2, signed: true, defaultPath: "environment.wind.angleApparent" },
+    { key: 81, name: "Wind Angle Apparent", scale: 0.0001, bytes: 2, signed: true, defaultPath: "environment.wind.angleApparent", read: true },
     { key: 83, name: "Target TWA", scale: 0.0001, bytes: 2, signed: true },
-    { key: 85, name: "Wind Speed True", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedTrue" },
-    { key: 86, name: "Wind Speed True 2", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedTrue" },
-    { key: 89, name: "Wind Angle True", scale: 0.0001, bytes: 2, signed: true, defaultPath: "environment.wind.angleTrueWater" },
+    { key: 85, name: "Wind Speed True", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedTrue", read: true },
+    { key: 86, name: "Wind Speed True 2", scale: 0.01, bytes: 2, signed: false, defaultPath: "environment.wind.speedTrue", read: true },
+    { key: 89, name: "Wind Angle True", scale: 0.0001, bytes: 2, signed: true, defaultPath: "environment.wind.angleTrueWater", read: true },
     { key: 100, name: "Unknown 100", scale: 1, bytes: 2, signed: true },
     { key: 102, name: "Keel Angle", scale: 0.0001, bytes: 2, signed: true },
     { key: 103, name: "Canard Angle", scale: 0.0001, bytes: 2, signed: true },
     { key: 104, name: "Keel Trim Tab Angle", scale: 0.0001, bytes: 2, signed: true },
-    { key: 105, name: "Course / Heading", scale: 0.0001, bytes: 2, signed: true, bearing: true, defaultPath: "navigation.headingTrue" },
-    { key: 109, name: "Wind Direction", scale: 0.0001, bytes: 2, signed: true, bearing: true, defaultPath: "environment.wind.directionTrue" },
+    { key: 105, name: "Course / Heading", scale: 0.0001, bytes: 2, signed: true, bearing: true, defaultPath: "navigation.headingTrue", read: true },
+    { key: 109, name: "Wind Direction", scale: 0.0001, bytes: 2, signed: true, bearing: true, defaultPath: "environment.wind.directionTrue", read: true },
     { key: 111, name: "Next Leg AWA", scale: 0.0001, bytes: 2, signed: true },
     { key: 113, name: "Next Leg AWS", scale: 0.01, bytes: 2, signed: false },
     { key: 117, name: "Race Timer", scale: 0.001, bytes: 4, signed: true },
@@ -112,13 +137,13 @@ module.exports = function (app) {
     { key: 126, name: "Polar Speed", scale: 0.01, bytes: 2, signed: false },
     { key: 127, name: "VMG to Wind", scale: 0.01, bytes: 2, signed: false },
     { key: 129, name: "DR Distance", scale: 0.01, bytes: 4, signed: false },
-    { key: 130, name: "Leeway Angle", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.leewayAngle" },
+    { key: 130, name: "Leeway Angle", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.leewayAngle", read: true },
     { key: 131, name: "Current Drift", scale: 0.01, bytes: 2, signed: false },
     { key: 132, name: "Current Set", scale: 0.0001, bytes: 2, signed: true },
-    { key: 135, name: "Barometric Pressure", scale: 100, bytes: 2, signed: false, defaultPath: "environment.outside.pressure" },
+    { key: 135, name: "Barometric Pressure", scale: 100, bytes: 2, signed: false, defaultPath: "environment.outside.pressure", read: true },
     { key: 152, name: "Distance to Start Line", scale: 0.01, bytes: 4, signed: true },
     { key: 154, name: "Heading on Opposite Tack", scale: 0.0001, bytes: 2, signed: true },
-    { key: 155, name: "Attitude Pitch", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.attitude.pitch" },
+    { key: 155, name: "Attitude Pitch", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.attitude.pitch", read: true },
     { key: 156, name: "Mast Angle", scale: 0.0001, bytes: 2, signed: true },
     { key: 157, name: "Wind Angle to Mast", scale: 0.0001, bytes: 2, signed: true },
     { key: 158, name: "Pitch Angle", scale: 0.0001, bytes: 2, signed: true },
@@ -126,14 +151,14 @@ module.exports = function (app) {
     { key: 164, name: "Boom Position", scale: 1, bytes: 2, signed: false },
     { key: 185, name: "MOB DR Bearing", scale: 0.0001, bytes: 2, signed: true },
     { key: 186, name: "MOB DR Range", scale: 0.01, bytes: 4, signed: false },
-    { key: 194, name: "Depth", scale: 0.01, bytes: 4, signed: false, defaultPath: "environment.depth.belowTransducer" },
-    { key: 195, name: "Depth 2", scale: 0.01, bytes: 4, signed: false, defaultPath: "environment.depth.belowKeel" },
-    { key: 199, name: "Aft Depth", scale: 0.01, bytes: 4, signed: false, defaultPath: "environment.depth.astem" },
+    { key: 194, name: "Depth", scale: 0.01, bytes: 4, signed: false, defaultPath: "environment.depth.belowTransducer", read: true },
+    { key: 195, name: "Depth 2", scale: 0.01, bytes: 4, signed: false, defaultPath: "environment.depth.belowKeel", read: true },
+    { key: 199, name: "Aft Depth", scale: 0.01, bytes: 4, signed: false, defaultPath: "environment.depth.astem", read: true },
     { key: 205, name: "Odometer", scale: 0.01, bytes: 4, signed: false },
     { key: 207, name: "Trip Distance", scale: 0.01, bytes: 4, signed: false },
     { key: 211, name: "DR Bearing", scale: 0.0001, bytes: 2, signed: true },
-    { key: 233, name: "Course Over Ground", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.courseOverGroundTrue" },
-    { key: 235, name: "Speed Over Ground", scale: 0.01, bytes: 2, signed: false, defaultPath: "navigation.speedOverGround" },
+    { key: 233, name: "Course Over Ground", scale: 0.0001, bytes: 2, signed: true, defaultPath: "navigation.courseOverGroundTrue", read: true },
+    { key: 235, name: "Speed Over Ground", scale: 0.01, bytes: 2, signed: false, defaultPath: "navigation.speedOverGround", read: true },
     { key: 239, name: "Remote 0", scale: 0.001, bytes: 2, signed: false },
     { key: 240, name: "Remote 1", scale: 0.001, bytes: 2, signed: false },
     { key: 241, name: "Remote 2", scale: 0.001, bytes: 2, signed: false },
@@ -230,6 +255,39 @@ module.exports = function (app) {
       type: "object",
       required: ["mappings"],
       properties: {
+        enableWriter: {
+          type: "boolean",
+          title: "Enable encode side (Signal K → PGN 130824 on the bus)",
+          description: "Transmits the mappings below, plus the H5000 emulation PGNs when emulation is on. This is the former bgkv-writer plugin.",
+          default: true
+        },
+        enableReader: {
+          type: "boolean",
+          title: "Enable decode side (PGN 130824 on the bus → Signal K)",
+          description: "Parses B&G key/value PGN 130824 seen on the bus and publishes the known keys as Signal K deltas. This is the former bgkv-reader plugin.",
+          default: false
+        },
+        readerContext: {
+          type: "string",
+          title: "Decode: Signal K context for updates",
+          default: "vessels.self"
+        },
+        readerSourceLabel: {
+          type: "string",
+          title: "Decode: source label to attach to values",
+          default: "B&G 130824"
+        },
+        readerEnabledKeys: {
+          type: "array",
+          title: "Decode: only process these B&G keys (optional, empty = all known keys)",
+          items: { type: "number" }
+        },
+        ignoreOwnTransmissions: {
+          type: "boolean",
+          title: "Decode: ignore PGN 130824 sent by this plugin's own emulated address",
+          description: "Prevents the decode side from re-publishing the values the encode side just transmitted, which would otherwise compete for source arbitration with the values that produced them. Only has an effect when both halves are enabled.",
+          default: true
+        },
         emitWindPgn130306: {
           type: "boolean",
           title: "Emit standard wind PGN 130306 (apparent wind)",
@@ -853,6 +911,316 @@ module.exports = function (app) {
   }
 
   // ===========================================================================
+  // Decode side: PGN 130824 → Signal K
+  // (merged in from the former signalk-bgkv-reader plugin)
+  // ===========================================================================
+
+  // The decode key set, derived from the single shared KEY_DEFS table rather
+  // than a second hand-maintained copy of the wire spec.
+  const READ_DEFS = new Map(
+    KEY_DEFS.filter((d) => d.read && d.defaultPath).map((d) => [d.key, d])
+  );
+
+  function toTwosComplementSigned(value, bits) {
+    // 2 ** rather than 1 << : bitwise operators are 32-bit signed in JS, so
+    // 1 << 32 wraps to 1 and would silently mis-sign every 4-byte key.
+    const signBit = 2 ** (bits - 1);
+    return value >= signBit ? value - (2 ** bits) : value;
+  }
+
+  // Bitstream reader for the nibble-packed key/value sequence.
+  class BitReader {
+    constructor(buf) {
+      this.buf = buf;
+      this.bitPos = 0; // bit index from start
+    }
+
+    bitsRemaining() {
+      return this.buf.length * 8 - this.bitPos;
+    }
+
+    readBits(n) {
+      if (n <= 0) return 0;
+      let result = 0;
+      for (let i = 0; i < n; i++) {
+        const byteIndex = (this.bitPos >> 3);
+        const bitIndex = this.bitPos & 7; // 0..7, LSB-first in a byte
+        const bit = (this.buf[byteIndex] >> bitIndex) & 1;
+        result |= (bit << i);
+        this.bitPos++;
+      }
+      return result;
+    }
+
+    alignToByte() {
+      const mod = this.bitPos & 7;
+      if (mod !== 0) this.bitPos += (8 - mod);
+    }
+  }
+
+  // Parse the B&G key/value stream from raw bytes. The caller strips the
+  // 2-byte proprietary header (PROPRI_HEADER) first — this starts at the
+  // first key.
+  function parseBGKeyValues(dataBuf) {
+    const reader = new BitReader(dataBuf);
+    const result = [];
+
+    while (reader.bitsRemaining() >= 16) {
+      // 12-bit key, 4-bit length — the inverse of the header word buildPayload
+      // writes as (key & 0xfff) | ((len & 0x0f) << 12).
+      const key = reader.readBits(12);
+      const len = reader.readBits(4);
+      if (len === 0) {
+        // Avoid infinite loop on malformed message
+        break;
+      }
+      if (reader.bitsRemaining() < len * 8) {
+        break; // incomplete
+      }
+      // Values are byte-aligned per definition after reading length nibble
+      const bytes = Buffer.allocUnsafe(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = reader.readBits(8);
+      }
+
+      result.push({ key, bytes });
+    }
+    return result;
+  }
+
+  // Try to coerce a data field into a byte array
+  function coerceToByteArray(dataField) {
+    if (!dataField) return null;
+    if (Array.isArray(dataField)) {
+      // Already an array of numbers or hex strings
+      if (dataField.length === 0) return [];
+      if (typeof dataField[0] === 'number') return dataField.slice();
+      // hex strings like "0x12" or "12"
+      return dataField.map((s) =>
+        typeof s === 'string' ? parseInt(s.replace(/^0x/i, ''), 16) : s
+      );
+    }
+    if (typeof dataField === 'string') {
+      // common forms: "01 23 45 67 89 ab cd ef" or "0123456789abcdef"
+      const s = dataField.trim();
+      const parts = s.includes(' ') ? s.split(/\s+/) : s.match(/.{1,2}/g) || [];
+      return parts.map((p) => parseInt(p.replace(/^0x/i, ''), 16)).filter((n) => !Number.isNaN(n));
+    }
+    return null;
+  }
+
+  function pgnSourceAddress(pgn) {
+    const fields = pgn.fields || {};
+    const src = pgn.src ?? pgn.Source ?? fields.src ?? fields.Source;
+    return typeof src === 'number' ? src : null;
+  }
+
+  // Fast-packet reassembly for the ISO FP used by PGN 130824.
+  // Frames are 8 bytes. First frame (frameNum=0): [seq(5b)|frame(3b=0), totalLen, d0..d5]
+  // Subsequent frames (frameNum>0): [seq(5b)|frame(3b>0), d..]
+  function handleFastPacket(pgn, rawBytes) {
+    const src = pgnSourceAddress(pgn);
+    const key = (src == null ? 'na' : src) + ':' + (pgn.pgn || 130824);
+    if (!Array.isArray(rawBytes) || rawBytes.length !== 8) return null;
+    const frameNum = (rawBytes[0] >> 5) & 0x07;
+    const seq = rawBytes[0] & 0x1f; // sequence cycles 0..31
+    let state = fpBuffers.get(key);
+
+    if (!state) {
+      if (frameNum !== 0) return null; // cannot start from a continuation frame
+      const totalLen = rawBytes[1];
+      if (totalLen == null || totalLen > 223) return null; // rudimentary guard
+      const data = [];
+      for (let i = 2; i < 8; i++) data.push(rawBytes[i]);
+      state = { seq, totalLen, data, frameNum, lastUpdate: Date.now() };
+      fpBuffers.set(key, state);
+    } else {
+      // Only accept the next frame numbers, but be tolerant of seq wrap
+      // Append payload bytes 1..7 for continuation frames
+      for (let i = 1; i < 8; i++) state.data.push(rawBytes[i]);
+      state.frameNum = frameNum;
+      state.seq = seq;
+      state.lastUpdate = Date.now();
+    }
+
+    // Trim to total length and emit when complete
+    if (state.data.length >= state.totalLen) {
+      const assembled = Buffer.from(state.data.slice(0, state.totalLen));
+      fpBuffers.delete(key);
+      return assembled;
+    }
+    return null;
+  }
+
+  function decodeNumber(bytes, expectedBytes, signed) {
+    // Little-endian, as is typical for N2K/canboat proprietary payloads.
+    // Accumulated by multiplication rather than shift-and-OR: << is 32-bit
+    // signed, so a 4-byte value with bit 31 set would come back negative.
+    let val = 0;
+    const n = Math.min(bytes.length, expectedBytes);
+    for (let i = 0; i < n; i++) {
+      val += bytes[i] * (2 ** (8 * i));
+    }
+    if (signed) {
+      val = toTwosComplementSigned(val, expectedBytes * 8);
+    }
+    return val;
+  }
+
+  function buildDelta(context, sourceLabel, values) {
+    if (values.length === 0) return null;
+    return {
+      context,
+      updates: [
+        {
+          source: { label: sourceLabel },
+          timestamp: new Date().toISOString(),
+          values
+        }
+      ]
+    };
+  }
+
+  function handlePgn130824(pgn, options) {
+    try {
+      // Expect canboat-style JSON: pgn.pgn === 130824 and pgn.fields.Data is array of bytes
+      const fields = pgn.fields || {};
+      if (typeof fields["Manufacturer Code"] === 'number' && fields["Manufacturer Code"] !== 381) {
+        return; // Not B&G
+      }
+      if (typeof fields["Industry Code"] === 'number' && fields["Industry Code"] !== 4) {
+        return; // Not Marine industry per spec
+      }
+
+      // Self-echo guard. When the encode side is emulating an H5000 on the same
+      // bus, our own transmissions come back through the server's N2K pipeline.
+      // Decoding them would republish, under this plugin's own $source, the
+      // values the encode side just read from sailprocessor — putting the
+      // plugin into source arbitration against its own inputs. The standalone
+      // reader could never do this: it had no way to know which address the
+      // writer had claimed.
+      const src = pgnSourceAddress(pgn);
+      if (
+        options.ignoreOwnTransmissions !== false &&
+        writerActive &&
+        src != null &&
+        src === sourceAddress
+      ) {
+        return;
+      }
+
+      // Prefer fully-assembled Data arrays
+      let dataArray = coerceToByteArray(fields.Data || fields.data || fields.Bytes || fields.bytes);
+      let buf = null;
+
+      // If canboat already parsed the PGN — it broke out Manufacturer Code and
+      // Industry Code as their own fields — then Data is an assembled payload
+      // whatever its length, and needs no fast-packet handling. Discriminating
+      // on those fields rather than on length matters for short payloads: a
+      // single-key message is only 2-4 bytes once the proprietary header is
+      // split off, and the old length test (>8 assembled, ==8 raw frame,
+      // anything else dropped) threw those away silently.
+      const preParsed = typeof fields["Manufacturer Code"] === 'number';
+
+      if (preParsed && Array.isArray(dataArray) && dataArray.length >= 2) {
+        buf = Buffer.from(dataArray);
+      } else if (Array.isArray(dataArray) && dataArray.length > 8) {
+        buf = Buffer.from(dataArray);
+      } else if (Array.isArray(dataArray) && dataArray.length === 8) {
+        // Looks like a raw 8-byte frame: try fast-packet assembly
+        const assembled = handleFastPacket(pgn, dataArray);
+        if (!assembled) return; // wait for more frames
+        buf = assembled;
+      } else if (!dataArray) {
+        // Some streams place frame bytes outside fields; try common fallbacks
+        const fallback = coerceToByteArray(pgn.data || pgn.bytes || pgn.Data || pgn.Bytes);
+        if (Array.isArray(fallback) && fallback.length === 8) {
+          const assembled = handleFastPacket(pgn, fallback);
+          if (!assembled) return;
+          buf = assembled;
+        } else if (Array.isArray(fallback) && fallback.length > 8) {
+          buf = Buffer.from(fallback);
+        } else {
+          return;
+        }
+      } else {
+        return;
+      }
+
+      const kvs = parseBGKeyValues(buf);
+      const outValues = [];
+      const only = options.readerEnabledKeys || options.enabledKeys;
+
+      kvs.forEach(({ key, bytes }) => {
+        if (Array.isArray(only) && only.length > 0 && !only.includes(key)) return;
+        const def = READ_DEFS.get(key);
+        if (!def) return; // key not in the decode set
+
+        const raw = decodeNumber(bytes, def.bytes, def.signed);
+        let value = raw * def.scale;
+        if (def.bearing) {
+          // Wire format is signed [-π, π); Signal K canonical bearings are
+          // [0, 2π). Exact inverse of the wrapPi the encode side applies.
+          const TWO_PI = 2 * Math.PI;
+          value = ((value % TWO_PI) + TWO_PI) % TWO_PI;
+        }
+
+        outValues.push({ path: def.defaultPath, value });
+      });
+
+      const delta = buildDelta(
+        options.readerContext || options.context || 'vessels.self',
+        options.readerSourceLabel || options.sourceLabel || plugin.name,
+        outValues
+      );
+      if (delta) {
+        app.handleMessage(plugin.id, delta);
+      }
+    } catch (e) {
+      app.error('BGKV decode error: ' + e.message);
+    }
+  }
+
+  function onAnyN2k(msg, options) {
+    if (!msg) return;
+    const pgn = msg.pgn || msg.PGN || msg;
+    const pgnNumber = typeof pgn === 'number' ? pgn : (pgn && pgn.pgn);
+    if (pgnNumber === 130824 || (pgn && pgn.pgn === 130824)) {
+      const p = typeof pgn === 'number' ? msg : pgn;
+      handlePgn130824(p, options);
+    }
+  }
+
+  function startReader(cfg) {
+    if (typeof app.on !== 'function') {
+      app.debug(plugin.name + ': decode side unavailable (app.on missing)');
+      return;
+    }
+    const handler = (data) => onAnyN2k(data, cfg);
+    const attached = [];
+    for (const ev of ['nmea2000Json', 'N2KAnalyzerOut', 'n2kJson']) {
+      try {
+        app.on(ev, handler);
+        attached.push(ev);
+      } catch (_) {}
+    }
+    n2kUnsubscribe = attached.map((ev) => () => {
+      try { app.removeListener(ev, handler); } catch (_) {}
+    });
+    fpBuffers.clear();
+    app.debug(
+      plugin.name + ': decode side listening for PGN 130824 on ' +
+      (attached.join(', ') || '(no event source available)')
+    );
+  }
+
+  function stopReader() {
+    n2kUnsubscribe.forEach((u) => u());
+    n2kUnsubscribe = [];
+    fpBuffers.clear();
+  }
+
+  // ===========================================================================
   // Plugin lifecycle
   // ===========================================================================
 
@@ -869,13 +1237,42 @@ module.exports = function (app) {
       rawCanChannel = null;
     }
     ourNAME = null;
+    stopReader();
+    writerActive = false;
 
-    if (!cfg.mappings || cfg.mappings.length === 0) {
-      app.setPluginStatus(plugin.id, "No mappings configured; nothing to send.");
+    // The two halves are independently switchable. Defaults preserve the
+    // posture the separate plugins were left in: encode on, decode off.
+    const readerEnabled = cfg.enableReader === true;
+    const writerEnabled = cfg.enableWriter !== false;
+    const readerNote = readerEnabled ? " + decode on" : "";
+
+    sourceAddress = cfg.defaultSourceAddress ?? 14;
+
+    if (readerEnabled) {
+      startReader(cfg);
+    }
+
+    if (!writerEnabled) {
+      app.setPluginStatus(
+        plugin.id,
+        readerEnabled ? "Decode only (encode side disabled)" : "Idle: both halves disabled"
+      );
       return;
     }
 
-    sourceAddress = cfg.defaultSourceAddress ?? 14;
+    if (!cfg.mappings || cfg.mappings.length === 0) {
+      app.setPluginStatus(
+        plugin.id,
+        readerEnabled
+          ? "Decode only (no mappings configured to send)"
+          : "No mappings configured; nothing to send."
+      );
+      return;
+    }
+
+    // From here the encode side is live, so the decode side must suppress our
+    // own transmissions.
+    writerActive = true;
 
     // Wire a delta listener if any mapping specifies a sourceFilter.
     // Updates the filteredValues cache keyed by `${path}||${sourceFilter}`.
@@ -961,7 +1358,7 @@ module.exports = function (app) {
 
     if (cfg.emulate !== true) {
       const wind130306Note = cfg.emitWindPgn130306 === true ? " + PGN 130306" : "";
-      app.setPluginStatus(plugin.id, `Running (emulation disabled)${wind130306Note}`);
+      app.setPluginStatus(plugin.id, `Running (emulation disabled)${wind130306Note}${readerNote}`);
       startDataTimers();
       app.emit("nmea2000OutAvailable");
       return;
@@ -992,7 +1389,7 @@ module.exports = function (app) {
       socketcan = require('socketcan');
     } catch (e) {
       app.debug(`socketcan not available (${e.message}); falling back to app.emit`);
-      app.setPluginStatus(plugin.id, "Warning: socketcan unavailable, emulation disabled");
+      app.setPluginStatus(plugin.id, `Warning: socketcan unavailable, emulation disabled${readerNote}`);
       startDataTimers();
       app.emit("nmea2000OutAvailable");
       return;
@@ -1029,7 +1426,7 @@ module.exports = function (app) {
         const addrHex = `0x${sourceAddress.toString(16).padStart(2, '0')}`;
         app.debug(`Address ${addrHex} claimed on ${canDevice}`);
         const wind130306Note = cfg.emitWindPgn130306 === true ? " + PGN 130306" : "";
-        app.setPluginStatus(plugin.id, `H5000 emulation on ${canDevice}, addr ${addrHex}${wind130306Note}`);
+        app.setPluginStatus(plugin.id, `H5000 emulation on ${canDevice}, addr ${addrHex}${wind130306Note}${readerNote}`);
         startDataTimers();
         // Broadcast Product Info unsolicited — real H5000 CPU does this on bus join.
         // Without this the Zeus shows '---' until it happens to send an ISO Request,
@@ -1057,12 +1454,22 @@ module.exports = function (app) {
     deltaListener = null;
     filteredValues.clear();
     ourNAME = null;
+    stopReader();
+    writerActive = false;
     app.debug(`${plugin.name} stopped`);
   };
 
   // Test-only: lets the test suite drive the encoder + SID counter without
-  // standing up the full timer machinery.
+  // standing up the full timer machinery, and drive the decode side against
+  // the encode side's real output for round-trip coverage.
   plugin._buildPgn130306Payload = buildPgn130306Payload;
+  plugin._buildPayload = buildPayload;
+  plugin._parseBGKeyValues = parseBGKeyValues;
+  plugin._decodeNumber = decodeNumber;
+  plugin._encodeNumber = encodeNumber;
+  plugin._keyDefs = KEY_DEFS;
+  plugin._readDefs = READ_DEFS;
+  plugin._proprietaryHeader = PROPRI_HEADER;
 
   return plugin;
 };

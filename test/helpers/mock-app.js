@@ -6,6 +6,8 @@ function makeMockApp() {
   const deltaListeners = [];
   const metadata = new Map();
   const selfPathStore = new Map();
+  // app.on / app.removeListener back the decode side's N2K subscription.
+  const n2kListeners = new Map();
 
   const app = {
     handleMessage(pluginId, delta /* , version */) {
@@ -21,6 +23,16 @@ function makeMockApp() {
       return undefined;
     },
     getPath() { return undefined; },
+    on(event, cb) {
+      if (!n2kListeners.has(event)) n2kListeners.set(event, []);
+      n2kListeners.get(event).push(cb);
+    },
+    removeListener(event, cb) {
+      const list = n2kListeners.get(event);
+      if (!list) return;
+      const idx = list.indexOf(cb);
+      if (idx >= 0) list.splice(idx, 1);
+    },
     getMetadata(p) {
       if (metadata.has(p)) return metadata.get(p);
       return undefined;
@@ -53,6 +65,15 @@ function makeMockApp() {
       for (const s of subscribers) s.cb(delta);
     },
     _delivered() { return delivered; },
+    // Feed one canboat-style N2K message to the decode side. Defaults to the
+    // first event name startReader attaches to.
+    _emitN2k(msg, event) {
+      const list = n2kListeners.get(event || 'nmea2000Json') || [];
+      for (const cb of list.slice()) cb(msg);
+    },
+    _n2kListenerCount(event) {
+      return (n2kListeners.get(event || 'nmea2000Json') || []).length;
+    },
     _clear() {
       delivered.length = 0;
     }
