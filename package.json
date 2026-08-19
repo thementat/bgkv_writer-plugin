@@ -3,6 +3,9 @@
   "version": "1.1.0",
   "description": "Signal K plugin to encode B&G PGN 130824 key/value data from Signal K paths",
   "main": "index.js",
+  "signalk": {
+    "displayName": "SSS: B&G Key/Value Writer (PGN 130824)"
+  },
   "scripts": {
     "test": "jest"
   },

@@ -17,7 +17,7 @@ module.exports = function (app) {
   const plugin = {};
 
   plugin.id = "bgkv-writer";
-  plugin.name = "B&G Key/Value Writer (PGN 130824)";
+  plugin.name = "SSS: B&G Key/Value Writer (PGN 130824)";
   plugin.description =
     "Encodes Signal K values into B&G proprietary key/value PGN 130824";
 
