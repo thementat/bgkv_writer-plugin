@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Signal K plugin to decode B&G PGN 130824 key/value data to Signal K paths",
   "main": "index.js",
+  "signalk": {
+    "displayName": "SSS: B&G Key/Value Reader (PGN 130824)"
+  },
   "scripts": {
     "test": "node -e \"require('./index.js'); console.log('load ok')\""
   },
